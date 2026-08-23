@@ -1,0 +1,262 @@
+#!/bin/zsh
+# cdxmax — Codex ORCHESTRATOR launcher (the Codex counterpart of cmax).
+#
+# Launches an interactive Codex (gpt-5.6-sol) session that acts as THE orchestrator: it
+# reads the project AGENTS.md (its brain), drives the same `neomax` machinery, and
+# farms work to any configured Claude/Codex/OpenCode/Kimi worker scope. Use this when you want to
+# run on Codex's bigger usage budget instead of Claude.
+#
+# A Codex session can't swap to Claude mid-run (and shouldn't) — the orchestrator engine
+# is fixed for the session; `neomax handoff` rotates Codex→Codex when it nears a limit.
+#
+# Usage:
+#   cdxmax                       Codex orchestrator on the least-busy Codex account;
+#                                workers = Codex only (the all-Codex mode).
+#   cdxmax N                     pin Codex account N as the orchestrator.
+#   cdxmax --workers all         Codex orchestrator that can farm to all five engines.
+#   cdxmax --workers claude,kimi arbitrary comma/plus-separated worker subset.
+#   cdxmax --workers codex       (default) Codex orchestrator, Codex workers only.
+#   cdxmax --workers opencode    Codex orchestrator, OpenCode workers only.
+#   cdxmax status                fleet status (same view as `neomax status`).
+#   cdxmax portal [port]         universal Claude + Codex + OpenCode + Kimi dashboard.
+#   cdxmax resume [<session-id>] resume a quit Codex orchestrator session (auto-finds the
+#                                owning account; latest orchestrator code/env applies).
+#   cdxmax --orchestrator        run on the DEDICATED orchestrator account (~/.codex-orch,
+#                                set up via `cdx orch`) — RESERVED: excluded from the
+#                                worker pool so orchestration always has quota.
+#   cdxmax <prompt...>           start already working on <prompt> (used by handoff).
+set -u
+
+PROFILES=("$HOME/.codex" $HOME/.codex-acct<2->(Nn/))
+CODEX_BIN="${NEOMAX_CODEX_BIN:-codex}"
+CODEX_MODEL="${NEOMAX_CODEX_MODEL:-gpt-5.6-sol}"
+CLAUDE_WORKER_MODEL="${NEOMAX_CLAUDE_MODEL:-claude-fable-5[1m]}"
+OPENCODE_WORKER_MODEL="${NEOMAX_OPENCODE_MODEL:-opencode-go/ox-alpha-free}"
+KIMI_WORKER_MODEL="${NEOMAX_KIMI_MODEL:-kimi-code/k3}"
+GROK_WORKER_MODEL="${NEOMAX_GROK_MODEL:-grok-4.6}"
+acct_num() { if [[ "$1" == "$HOME/.codex" ]]; then print 1; elif [[ "$1" == *-orch ]]; then print orch; else print "${1##*-acct}"; fi }
+codex_prof_for() { if (( $1 == 1 )); then print "$HOME/.codex"; else print "$HOME/.codex-acct$1"; fi }
+logged_in() { [[ -f "$1/auth.json" ]]; }
+
+ensure_codex_profile() {
+  local prof="$1"
+  mkdir -p "$prof"
+  [[ "$prof" != "$HOME/.codex" && -f "$HOME/.codex/config.toml" && ! -f "$prof/config.toml" ]] \
+    && cp "$HOME/.codex/config.toml" "$prof/config.toml"
+  return 0
+}
+
+# Codex has NO SessionStart hook (that mechanism is Claude-only), so a fresh Codex
+# orchestrator boots with no idea it's driving the fleet — it literally asked "which 3
+# accounts?". This prints the engine/project-aware orchestrator opener (`neomax orient`,
+# which reads NEOMAX_ROLE=codex + the cwd's project + the live fleet); the caller injects it
+# as Codex's INITIAL PROMPT so the session self-orients, prints its confirmation, and waits
+# — exactly like the Claude side does via its hook. Callers only use it when the user gave
+# NO prompt of their own (a handoff/explicit prompt already carries its own orientation).
+orchestrator_opener() { neomax orient 2>/dev/null; }
+
+# in-flight codex workers on a CODEX_HOME, from the durable neomax registry (exact;
+# codex's node+native process tree makes ps-counting unreliable).
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import json, os, sys, glob
+profile = sys.argv[1]; runs = os.path.expanduser("~/.neomax/runs"); n = 0
+for f in glob.glob(os.path.join(runs, "*.json")):
+    try: r = json.load(open(f))
+    except Exception: continue
+    if r.get("engine") == "codex" and r.get("profile") == profile and r.get("status") == "running":
+        try: os.kill(r.get("worker_pid"), 0); n += 1
+        except Exception: pass
+print(n)
+PY
+}
+
+launch_portal() {
+  local self_dir="${0:A:h}" portal="${NEOMAX_PORTAL_BIN:-}"
+  if [[ -z "$portal" && -x "$self_dir/neomax-portal" ]]; then portal="$self_dir/neomax-portal"
+  elif [[ -z "$portal" ]] && command -v neomax-portal >/dev/null 2>&1; then portal="neomax-portal"
+  fi
+  [[ -n "$portal" ]] || { print "cdxmax: neomax-portal not found" >&2; return 1; }
+  exec "$portal" "$@"
+}
+
+if [[ "${1:-}" == "portal" ]]; then
+  shift; launch_portal "$@"
+fi
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- 'usage: cdxmax [ACCOUNT] [--workers SCOPE] [--model MODEL] [INITIAL_TASK...]
+       cdxmax --orchestrator [--workers SCOPE] [--model MODEL]
+       cdxmax resume [SESSION_ID] [--model MODEL]
+       cdxmax status | portal [PORT]
+
+Codex defaults to gpt-5.6-sol. Every --ENGINE-model MODEL flag sets that delegated
+worker pool; --codex-model is an alias for the orchestrator --model.'
+  exit 0
+fi
+
+# `cdxmax status` → the shared all-engines board owned by Neomax.
+if [[ "${1:-}" == "status" ]]; then
+  local self_dir="${0:A:h}" neomax_bin=""
+  if [[ -x "$self_dir/neomax" ]]; then neomax_bin="$self_dir/neomax"
+  elif command -v neomax >/dev/null 2>&1; then neomax_bin="neomax"; fi
+  [[ -n "$neomax_bin" ]] && exec "$neomax_bin" status
+  print "neomax not found"; exit 1
+fi
+
+# --workers all|ENGINE[,ENGINE...] : fleet SCOPE. Default codex (the all-Codex mode is the main use
+# case). Filtered out before args reach `codex`; exported as NEOMAX_FLEET + NEOMAX_ROLE=codex.
+local fleet="codex" want_orch=0; local newargs=()
+while (( $# )); do
+  case "$1" in
+    --workers) fleet="${2:-codex}"; shift 2;;
+    --workers=*) fleet="${1#--workers=}"; shift;;
+    --orchestrator) want_orch=1; shift;;
+    --model|--codex-model) CODEX_MODEL="$2"; shift 2;;
+    --model=*|--codex-model=*) CODEX_MODEL="${1#*=}"; shift;;
+    --claude-model) CLAUDE_WORKER_MODEL="$2"; shift 2;;
+    --claude-model=*) CLAUDE_WORKER_MODEL="${1#*=}"; shift;;
+    --opencode-model) OPENCODE_WORKER_MODEL="$2"; shift 2;;
+    --opencode-model=*) OPENCODE_WORKER_MODEL="${1#*=}"; shift;;
+    --kimi-model) KIMI_WORKER_MODEL="$2"; shift 2;;
+    --kimi-model=*) KIMI_WORKER_MODEL="${1#*=}"; shift;;
+    --grok-model) GROK_WORKER_MODEL="$2"; shift 2;;
+    --grok-model=*) GROK_WORKER_MODEL="${1#*=}"; shift;;
+    *) newargs+=("$1"); shift;;
+  esac
+done
+set -- "${newargs[@]}"
+python3 - "$fleet" <<'PY' || { print "cdxmax: --workers must be all or a comma/plus list of claude,codex,opencode,kimi,grok" >&2; exit 2; }
+import re, sys
+p = {x for x in re.split(r"[,+]", sys.argv[1]) if x}
+raise SystemExit(0 if sys.argv[1] == "all" or (p and p <= {"claude","codex","opencode","kimi","grok"}) else 1)
+PY
+if [[ "${1:-}" == "portal" ]]; then shift; launch_portal "$@"; fi
+if [[ "${1:-}" == "status" ]]; then exec "$0" status "${@:2}"; fi
+export NEOMAX_FLEET="$fleet" NEOMAX_ROLE="codex" NEOMAX_PROJECT_ROOT="$PWD"
+export NEOMAX_CLAUDE_MODEL="$CLAUDE_WORKER_MODEL" NEOMAX_CODEX_MODEL="$CODEX_MODEL"
+export NEOMAX_OPENCODE_MODEL="$OPENCODE_WORKER_MODEL" NEOMAX_KIMI_MODEL="$KIMI_WORKER_MODEL"
+export NEOMAX_GROK_MODEL="$GROK_WORKER_MODEL"
+# CO-ORCHESTRATION: a unique id + pid for THIS Codex orchestrator session, so concurrent
+# orchestrators see each other + scope their own runs + coordinate merges. $$ is this launcher,
+# which `exec codex` keeps as the orchestrator pid; registered just before each exec.
+export NEOMAX_ORCH_SESSION="orch-codex-$$-$(date +%s)"
+export NEOMAX_ORCH_PID=$$
+_register_orch() { command neomax orch-register 2>/dev/null || true; }
+
+# `cdxmax --orchestrator` — Codex orchestrator on the DEDICATED reserved account
+# (~/.codex-orch, authenticated via `cdx orch`); excluded from the worker pool.
+if (( want_orch )); then
+  local oprof="$HOME/.codex-orch"
+  if ! logged_in "$oprof"; then
+    print "cdxmax: no dedicated Codex orchestrator account — set it up first: cdx orch"
+    exit 1
+  fi
+  export NEOMAX_ORCH_RESERVED=1 CODEX_HOME="$oprof"
+  print "cdxmax → DEDICATED Codex orchestrator ($oprof, RESERVED — excluded from the worker pool) · workers=$fleet"
+  if (( $# == 0 )); then                 # no user prompt → seed Codex with the orchestrator opener
+    local op; op="$(orchestrator_opener)"
+    [[ -n "$op" ]] && set -- "$op"
+  fi
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: codex -m $CODEX_MODEL -c service_tier=fast -a never -s danger-full-access -C $PWD ${1:+<initial-prompt>}"; exit 0; fi
+  _register_orch
+  exec "$CODEX_BIN" -m "$CODEX_MODEL" -c service_tier=fast -a never -s danger-full-access -C "$PWD" "$@"
+fi
+
+# `cdxmax resume [<session-id>]` — resume a quit Codex orchestrator session with the
+# LATEST orchestrator code/env. The session id is the UUID in the rollout filename
+# (<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl); `codex resume` only
+# sees sessions under the active CODEX_HOME, so we auto-locate the owning account
+# across every Codex profile. No id = the most recent session anywhere.
+if [[ "${1:-}" == "resume" || "${1:-}" == "--resume" ]]; then
+  shift
+  local rid=""
+  [[ -n "${1:-}" && "${1:-}" != -* ]] && { rid="$1"; shift }
+  local loc
+  loc=$(python3 - "$rid" <<'PY'
+import glob, os, sys
+ident = sys.argv[1]
+profs = ([os.path.expanduser("~/.codex")] + sorted(glob.glob(os.path.expanduser("~/.codex-acct*")))
+         + [d for d in [os.path.expanduser("~/.codex-orch")] if os.path.isdir(d)])
+best = None
+for p in profs:
+    for f in glob.glob(os.path.join(p, "sessions", "**", "rollout-*.jsonl"), recursive=True):
+        base = os.path.basename(f)[:-6]          # rollout-<ts>-<uuid>
+        sid = base[-36:]                          # trailing uuid
+        if ident:
+            # exact session uuid, or an unambiguous >=8-char prefix of it. NOT base.endswith
+            # (that matched a short ident against the rollout timestamp tail -> wrong session).
+            if sid == ident or (len(ident) >= 8 and sid.startswith(ident)):
+                print(p + "\t" + sid); sys.exit(0)
+        else:
+            m = os.path.getmtime(f)
+            if best is None or m > best[0]:
+                best = (m, p, sid)
+if not ident and best:
+    print(best[1] + "\t" + best[2]); sys.exit(0)
+sys.exit(1)
+PY
+  ) || { print "cdxmax: session ${rid:-<most recent>} not found in any Codex account profile"; exit 1 }
+  local rprof="${loc%%	*}" rsid="${loc##*	}"
+  if ! logged_in "$rprof"; then
+    print "cdxmax: account $(acct_num "$rprof") owns that session but is not logged in — run: cdx login $(acct_num "$rprof")"
+    exit 1
+  fi
+  print "cdxmax → resuming session $rsid on Codex account $(acct_num "$rprof") ($rprof) · workers=$fleet"
+  export CODEX_HOME="$rprof"
+  # Codex has no SessionStart hook, so a resumed session keeps the opener it read at START —
+  # it WON'T pick up harness/opener updates on its own. When resuming with no prompt of your
+  # own, inject a refresh nudge so the orchestrator re-reads its CURRENT directives (delegation
+  # / 5h-usage leveling / engine routing / reporting) before continuing. (For a FULL re-orient,
+  # start a fresh `cdxmax` instead — that injects the whole latest opener.)
+  if (( $# == 0 )); then
+    set -- "SYSTEM — your Neomax orchestrator harness may have been UPDATED since this session started. Before continuing, run \`neomax orient\` and adopt any changed directives (dispatch-by-default + LEVEL the 5-hour usage across accounts, scale via sub-agents when saturated, engine routing: UI→Claude when both engines are live, fleet-cost reporting). Then continue exactly where you left off."
+  fi
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: codex -m $CODEX_MODEL -c service_tier=fast -a never -s danger-full-access -C $PWD resume $rsid ${1:+<refresh/prompt>}"; exit 0
+  fi
+  _register_orch
+  exec "$CODEX_BIN" -m "$CODEX_MODEL" -c service_tier=fast -a never -s danger-full-access -C "$PWD" resume "$rsid" "$@"
+fi
+
+# pick the orchestrator account: explicit N, else least-busy logged-in Codex account.
+local pick=""
+if [[ "${1:-}" == <1-> ]]; then
+  local n="$1"; shift
+  pick="$(codex_prof_for "$n")"
+  ensure_codex_profile "$pick"
+else
+  # USAGE-AWARE orchestrator pick (single source of truth = neomax): freshest logged-in
+  # Codex account that is NOT paused and NOT weekly-exhausted. Neomax selection avoids the old
+  # picker only counted live sessions and would land on a maxed/paused account.
+  pick="$(command neomax pick-orch --engine codex 2>/dev/null)"
+  if [[ -z "$pick" || ! -d "$pick" ]]; then
+    local best_n=999999 n
+    for p in "${PROFILES[@]}"; do
+      logged_in "$p" || continue
+      command neomax paused --json 2>/dev/null | grep -q "\"$(basename "$p")\"" && continue  # skip paused
+      n=$(count_live "$p")
+      if (( n < best_n )); then pick=$p; best_n=$n; fi
+    done
+  fi
+  [[ -z "$pick" ]] && pick="$HOME/.codex"   # fall back to default even if not yet logged in
+fi
+
+if ! logged_in "$pick"; then
+  print "cdxmax: Codex account $(acct_num "$pick") ($pick) is not logged in — run: cdx login $(acct_num "$pick")"
+  exit 1
+fi
+
+print "cdxmax → Codex orchestrator on account $(acct_num "$pick") ($pick) · workers=$fleet"
+export CODEX_HOME="$pick"
+# Interactive Codex as the trusted orchestrator: selected model (gpt-5.6-sol by default), fast mode, no approval
+# prompts + full access so it can run neomax freely (the workers it spawns are themselves sandboxed
+# per neomax). Runs in the current dir so it reads the project AGENTS.md. Any extra
+# args (e.g. a handoff resume prompt) pass through as the initial prompt.
+if (( $# == 0 )); then                 # no user prompt → seed Codex with the orchestrator opener
+  local op; op="$(orchestrator_opener)"
+  [[ -n "$op" ]] && set -- "$op"
+fi
+if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: codex -m $CODEX_MODEL -c service_tier=fast -a never -s danger-full-access -C $PWD ${1:+<initial-prompt>}"; exit 0; fi
+_register_orch
+exec "$CODEX_BIN" -m "$CODEX_MODEL" -c service_tier=fast -a never -s danger-full-access -C "$PWD" "$@"

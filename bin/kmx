@@ -1,0 +1,178 @@
+#!/bin/zsh
+set -u
+
+KIMI_BIN="${NEOMAX_KIMI_BIN:-kimi}"
+KIMI_MODEL="${NEOMAX_KIMI_MODEL:-kimi-code/k3}"
+DEFAULT_PROFILE="$HOME/.kimi-code"
+STATE_COOLDOWN="$HOME/.neomax/cooldown.json"
+SELF_DIR="${0:A:h}"
+KIMI_SKILLS_DIR="$SELF_DIR/../kimi/skills"
+
+profile_for() { if (( $1 == 1 )); then print "$DEFAULT_PROFILE"; else print "$HOME/.kimi-code-acct$1"; fi }
+install_skills() {
+  local profile="$1" skill
+  [[ -d "$KIMI_SKILLS_DIR" ]] || return 0
+  mkdir -p "$profile/skills"
+  for skill in neomax rotate find-issues fix-issues; do
+    ln -sfn "$KIMI_SKILLS_DIR/$skill" "$profile/skills/$skill"
+  done
+}
+set_profile_env() {
+  mkdir -p "$1"
+  install_skills "$1"
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then unset KIMI_CODE_HOME
+  else export KIMI_CODE_HOME="$1"
+  fi
+}
+auth_method() {
+  python3 - "$1/credentials/kimi-code.json" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1])) or {}
+    if d.get("access_token") or d.get("refresh_token"):
+        print("OAuth"); raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PY
+  if (( $? == 0 )); then print OAuth; return 0; fi
+  python3 - "$1/config.toml" <<'PY' 2>/dev/null
+import re,sys
+try: s=open(sys.argv[1]).read()
+except OSError: raise SystemExit(1)
+if re.search(r'^\s*api_key\s*=\s*["\'][^"\']+["\']\s*$',s,re.M): print("API key")
+else: raise SystemExit(1)
+PY
+}
+logged_in() { auth_method "$1" >/dev/null 2>&1; }
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import glob, json, os, sys
+n = 0
+for path in glob.glob(os.path.expanduser("~/.neomax/runs/*.json")):
+    try:
+        r = json.load(open(path))
+        if r.get("engine") == "kimi" and r.get("profile") == sys.argv[1] and r.get("status") == "running":
+            os.kill(int(r.get("worker_pid")), 0); n += 1
+    except Exception:
+        pass
+print(n)
+PY
+}
+
+if [[ "${1:-}" == <1-> ]]; then set -- login "$1" choose; fi
+if [[ "${1:-}" == "orch" || "${1:-}" == "orchestrator" ]]; then set -- login orch choose "${@:2}"; fi
+cmd="${1:-status}"
+
+if [[ "$cmd" == "help" || "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+  print -r -- 'usage: kmx login N|orch [oauth [global|mainland-cn]|api-key|choose]
+       kmx N
+       kmx run [N] [--model MODEL] [KIMI_ARGS...]
+       kmx models [N]
+       kmx status
+       kmx whoami [N|orch]
+
+oauth uses Kimi Code device-code login. api-key/choose opens Kimi’s own /login selector.
+Kimi profiles are isolated with KIMI_CODE_HOME. K3 workers and kmax use managed OAuth.'
+  exit 0
+fi
+
+if [[ "$cmd" == "models" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then n="$2"; shift 2; else n=1; shift; fi
+  prof="$(profile_for "$n")"; set_profile_env "$prof"
+  exec "$KIMI_BIN" provider list --json "$@"
+fi
+
+if [[ "$cmd" == "login" ]]; then
+  n="${2:-}"
+  if [[ "$n" == "orch" ]]; then prof="$HOME/.kimi-code-orch"
+  elif [[ -z "$n" || "$n" != <1-> ]]; then print "usage: kmx login N|orch"; exit 2
+  else prof="$(profile_for "$n")"
+  fi
+  set_profile_env "$prof"
+  mode="${3:-choose}"
+  case "$mode" in
+    oauth|device|device-code)
+      print "kmx → Kimi Code OAuth device login for account $n ($prof)"
+      region="${4:-}"
+      if [[ -n "$region" ]]; then
+        [[ "$region" == "global" || "$region" == "mainland-cn" ]] || { print "kmx: OAuth region must be global or mainland-cn"; exit 2; }
+        "$KIMI_BIN" login --region "$region"
+      else
+        "$KIMI_BIN" login
+      fi
+      ;;
+    api-key|apikey)
+      print "kmx → Kimi Platform API-key login for account $n ($prof)"
+      print 'In Kimi, enter /login, then select Kimi Platform API key and the desired region/model. Exit when connected.'
+      "$KIMI_BIN"
+      ;;
+    choose)
+      print "kmx → Kimi authentication selector for account $n ($prof)"
+      print 'In Kimi, enter /login, then choose Kimi Code OAuth or either Kimi Platform API-key region. Exit when connected.'
+      "$KIMI_BIN"
+      ;;
+    *) print "kmx: mode must be oauth, api-key, or choose"; exit 2;;
+  esac
+  logged_in "$prof" || { print "kmx: login did not complete"; exit 1; }
+  print "kmx: account $n connected via $(auth_method "$prof") ✓"
+  exit 0
+fi
+
+if [[ "$cmd" == "run" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then n="$2"; shift 2
+  else n=1; shift
+  fi
+  model="$KIMI_MODEL"; explicit_model=0; runargs=()
+  while (( $# )); do
+    case "$1" in
+      --model|--kimi-model) model="$2"; explicit_model=1; shift 2;;
+      --model=*|--kimi-model=*) model="${1#*=}"; explicit_model=1; shift;;
+      *) runargs+=("$1"); shift;;
+    esac
+  done
+  set -- "${runargs[@]}"
+  prof="$(profile_for "$n")"
+  logged_in "$prof" || { print "kmx: account $n is not logged in — run: kmx login $n"; exit 1; }
+  set_profile_env "$prof"
+  mode="$(auth_method "$prof")"
+  if [[ "$mode" == "OAuth" ]]; then
+    print "kmx → Kimi account $n ($prof) · $model"
+    if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: kimi -m $model $*"; exit 0; fi
+    exec "$KIMI_BIN" -m "$model" "$@"
+  fi
+  if (( explicit_model )); then
+    print "kmx → Kimi account $n ($prof) · API key · $model"
+    if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: kimi -m $model $*"; exit 0; fi
+    exec "$KIMI_BIN" -m "$model" "$@"
+  fi
+  print "kmx → Kimi account $n ($prof) · native API-key provider/model"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: kimi $*"; exit 0; fi
+  exec "$KIMI_BIN" "$@"
+fi
+
+if [[ "$cmd" == "whoami" ]]; then
+  n="${2:-1}"
+  if [[ "$n" == "orch" ]]; then prof="$HOME/.kimi-code-orch"
+  elif [[ "$n" == <1-> ]]; then prof="$(profile_for "$n")"
+  else print "usage: kmx whoami N|orch"; exit 2
+  fi
+  set_profile_env "$prof"
+  exec "$KIMI_BIN" provider list
+fi
+
+[[ "$cmd" == "status" ]] || { print "usage: kmx login N|orch [oauth|api-key|choose] | run [N] [--model MODEL] [args] | models [N] | status | whoami [N|orch]"; exit 2; }
+now=$(date +%s); hi=1
+for d in $HOME/.kimi-code-acct<2->(Nn/); do (( ${d##*-acct} > hi )) && hi="${d##*-acct}"; done
+for (( n=1; n<=hi; n++ )); do
+  prof="$(profile_for "$n")"; live="$(count_live "$prof")"
+  auth="NOT LOGGED IN — run: kmx login $n"; logged_in "$prof" && auth="connected via $(auth_method "$prof")"
+  cool=$(python3 - "$STATE_COOLDOWN" "$prof" <<'PY' 2>/dev/null
+import json, sys
+try: print(int(json.load(open(sys.argv[1])).get(sys.argv[2], 0)))
+except Exception: print(0)
+PY
+  )
+  (( cool > now )) && auth="$auth, rate-limit cooldown $(( (cool - now) / 60 ))m left"
+  print "kimi account $n  $prof  —  $live live worker(s), $auth · default $KIMI_MODEL"
+done

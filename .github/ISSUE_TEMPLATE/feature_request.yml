@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a focused Neomax improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or contributor problem should Neomax solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the public CLI, workflow, or integration behavior you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Provider and compatibility impact
+      description: Note affected providers, models, platforms, state migrations, or portal surfaces.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and pull requests for this proposal.
+          required: true
+        - label: I have not included credentials, personal paths, or private project information.
+          required: true

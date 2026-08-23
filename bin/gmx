@@ -1,0 +1,214 @@
+#!/bin/zsh
+set -u
+
+GROK_BIN="${NEOMAX_GROK_BIN:-grok}"
+GROK_MODEL="${NEOMAX_GROK_MODEL:-grok-4.6}"
+DEFAULT_PROFILE="$HOME/.grok"
+STATE_COOLDOWN="$HOME/.neomax/cooldown.json"
+SELF_DIR="${0:A:h}"
+GROK_COMMANDS_DIR="$SELF_DIR/../grok/commands"
+
+profile_for() { if (( $1 == 1 )); then print "$DEFAULT_PROFILE"; else print "$HOME/.grok-acct$1"; fi }
+install_commands() {
+  local profile="$1" command_name
+  [[ -d "$GROK_COMMANDS_DIR" ]] || return 0
+  mkdir -p "$profile/commands"
+  for command_name in neomax rotate find-issues fix-issues; do
+    ln -sfn "$GROK_COMMANDS_DIR/$command_name.md" "$profile/commands/$command_name.md"
+  done
+}
+set_profile_env() {
+  mkdir -p "$1"
+  install_commands "$1"
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then unset GROK_HOME
+  else export GROK_HOME="$1"
+  fi
+}
+auth_method() {
+  python3 - "$1/auth.json" <<'PY' 2>/dev/null
+import json,sys
+try:
+    d=json.load(open(sys.argv[1])) or {}
+except Exception:
+    raise SystemExit(1)
+rows=[v for v in d.values() if isinstance(v,dict) and v.get("key")]
+if not rows: raise SystemExit(1)
+raw=str(rows[0].get("auth_mode") or "connected").lower()
+mode="OAuth" if raw in ("oidc","oauth") else ("API key" if raw=="api_key" else raw.replace("_"," ").title())
+print(mode)
+PY
+}
+logged_in() { auth_method "$1" >/dev/null 2>&1; }
+set_preferred() {
+  python3 - "$1/config.toml" "$2" <<'PY'
+import os,re,sys
+path,mode=sys.argv[1:]
+try: s=open(path).read()
+except OSError: s=""
+lines=s.splitlines()
+out=[]; in_auth=False; wrote=False
+for line in lines:
+    m=re.match(r"\s*\[([^]]+)\]\s*$",line)
+    if m:
+        if in_auth and not wrote:
+            out.append('preferred_method = "%s"' % mode); wrote=True
+        in_auth=m.group(1).strip()=="auth"
+    if in_auth and re.match(r"\s*preferred_method\s*=",line):
+        if not wrote: out.append('preferred_method = "%s"' % mode); wrote=True
+        continue
+    out.append(line)
+if in_auth and not wrote: out.append('preferred_method = "%s"' % mode); wrote=True
+if not wrote:
+    if out and out[-1].strip(): out.append("")
+    out.extend(["[auth]",'preferred_method = "%s"' % mode])
+os.makedirs(os.path.dirname(path),exist_ok=True)
+tmp=path+".tmp"
+with open(tmp,"w") as f: f.write("\n".join(out).rstrip()+"\n")
+os.replace(tmp,path)
+PY
+}
+store_api_key() {
+  local prof="$1" key
+  read -s "key?xAI API key: "
+  print
+  [[ -n "$key" ]] || { print "gmx: API key cannot be empty"; return 2; }
+  KEY_VALUE="$key" python3 - "$prof/auth.json" <<'PY'
+import datetime,json,os,sys
+path=sys.argv[1]
+try:
+    with open(path) as f: data=json.load(f) or {}
+except Exception: data={}
+data["xai::api_key"]={
+    "key":os.environ.pop("KEY_VALUE"),"auth_mode":"api_key",
+    "create_time":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "user_id":"","email":None,"team_blocked_reasons":[],
+    "coding_data_retention_opt_out":True,
+}
+os.makedirs(os.path.dirname(path),exist_ok=True)
+tmp=path+".tmp"
+with open(tmp,"w") as f: json.dump(data,f,indent=2)
+os.chmod(tmp,0o600); os.replace(tmp,path)
+PY
+  unset key
+  set_preferred "$prof" api_key
+}
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import glob,json,os,sys
+n=0
+for p in glob.glob(os.path.expanduser("~/.neomax/runs/*.json")):
+    try:
+        r=json.load(open(p))
+        if r.get("engine")=="grok" and r.get("profile")==sys.argv[1] and r.get("status")=="running":
+            os.kill(int(r.get("worker_pid")),0); n+=1
+    except Exception: pass
+print(n)
+PY
+}
+
+if [[ "${1:-}" == <1-> ]]; then set -- login "$1" choose; fi
+if [[ "${1:-}" == "orch" || "${1:-}" == "orchestrator" ]]; then set -- login orch choose "${@:2}"; fi
+cmd="${1:-status}"
+
+if [[ "$cmd" == "help" || "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+  print -r -- 'usage: gmx login N|orch [oauth|device|api-key|choose]
+       gmx N
+       gmx run [N] [--model MODEL] [GROK_ARGS...]
+       gmx models [N]
+       gmx status
+       gmx whoami [N|orch]
+
+oauth is browser OAuth; device is OAuth device-code; api-key prompts securely.
+Profiles are isolated with GROK_HOME. grok-4.6 is the default model.'
+  exit 0
+fi
+
+if [[ "$cmd" == "models" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then n="$2"; shift 2; else n=1; shift; fi
+  prof="$(profile_for "$n")"; set_profile_env "$prof"
+  exec "$GROK_BIN" models "$@"
+fi
+
+if [[ "$cmd" == "login" ]]; then
+  n="${2:-}"
+  if [[ "$n" == "orch" ]]; then prof="$HOME/.grok-orch"
+  elif [[ -z "$n" || "$n" != <1-> ]]; then print "usage: gmx login N|orch [oauth|device|api-key|choose]"; exit 2
+  else prof="$(profile_for "$n")"
+  fi
+  mode="${3:-choose}"
+  if [[ "$mode" == "choose" ]]; then
+    print 'Choose authentication: 1) browser OAuth  2) device OAuth  3) API key'
+    read "choice?Selection [1]: "; choice="${choice:-1}"
+    case "$choice" in 1) mode=oauth;; 2) mode=device;; 3) mode=api-key;; *) print "gmx: invalid selection"; exit 2;; esac
+  fi
+  set_profile_env "$prof"
+  case "$mode" in
+    oauth) set_preferred "$prof" oidc; "$GROK_BIN" login --oauth;;
+    device|device-code) set_preferred "$prof" oidc; "$GROK_BIN" login --device-auth;;
+    api-key|apikey) store_api_key "$prof";;
+    *) print "gmx: mode must be oauth, device, api-key, or choose"; exit 2;;
+  esac
+  logged_in "$prof" || { print "gmx: authentication did not complete"; exit 1; }
+  print "gmx: Grok account $n connected ($(auth_method "$prof")) ✓"
+  exit 0
+fi
+
+if [[ "$cmd" == "run" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then n="$2"; shift 2
+  else n=1; shift
+  fi
+  model="$GROK_MODEL"; runargs=()
+  while (( $# )); do
+    case "$1" in
+      --model|--grok-model) model="$2"; shift 2;;
+      --model=*|--grok-model=*) model="${1#*=}"; shift;;
+      *) runargs+=("$1"); shift;;
+    esac
+  done
+  set -- "${runargs[@]}"
+  prof="$(profile_for "$n")"
+  logged_in "$prof" || { print "gmx: account $n is not connected — run: gmx login $n"; exit 1; }
+  set_profile_env "$prof"
+  print "gmx → Grok account $n ($prof) · $model"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: grok --model $model $*"; exit 0; fi
+  exec "$GROK_BIN" --no-auto-update --model "$model" "$@"
+fi
+
+if [[ "$cmd" == "whoami" ]]; then
+  n="${2:-1}"
+  if [[ "$n" == "orch" ]]; then prof="$HOME/.grok-orch"
+  elif [[ "$n" == <1-> ]]; then prof="$(profile_for "$n")"
+  else print "usage: gmx whoami N|orch"; exit 2
+  fi
+  python3 - "$prof/auth.json" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1])) or {}
+except Exception: raise SystemExit("not connected")
+rows=[v for v in d.values() if isinstance(v,dict) and v.get("key")]
+if not rows: raise SystemExit("not connected")
+v=rows[0]; name=" ".join(x for x in (v.get("first_name"),v.get("last_name")) if x)
+raw=str(v.get("auth_mode") or "connected").lower()
+method="OAuth" if raw in ("oidc","oauth") else ("API key" if raw=="api_key" else raw.replace("_"," "))
+print("method: %s" % method)
+if v.get("email"): print("email: %s" % v["email"])
+if name: print("name: %s" % name)
+if v.get("team_name"): print("team: %s" % v["team_name"])
+PY
+  exit $?
+fi
+
+[[ "$cmd" == "status" ]] || { print "usage: gmx login N|orch [mode] | run [N] [--model MODEL] [args] | models [N] | status | whoami [N|orch]"; exit 2; }
+now=$(date +%s); hi=1
+for d in $HOME/.grok-acct<2->(Nn/); do (( ${d##*-acct} > hi )) && hi="${d##*-acct}"; done
+for (( n=1; n<=hi; n++ )); do
+  prof="$(profile_for "$n")"; live="$(count_live "$prof")"
+  auth="NOT CONNECTED — run: gmx login $n"; logged_in "$prof" && auth="connected via $(auth_method "$prof")"
+  cool=$(python3 - "$STATE_COOLDOWN" "$prof" <<'PY' 2>/dev/null
+import json,sys
+try: print(int(json.load(open(sys.argv[1])).get(sys.argv[2],0)))
+except Exception: print(0)
+PY
+  )
+  (( cool > now )) && auth="$auth, rate-limit cooldown $(( (cool-now)/60 ))m left"
+  print "grok account $n  $prof  —  $live live worker(s), $auth · model $GROK_MODEL"
+done

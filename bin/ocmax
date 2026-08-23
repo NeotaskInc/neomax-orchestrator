@@ -1,0 +1,283 @@
+#!/bin/zsh
+# ocmax — OpenCode orchestrator launcher (OX Alpha Free by default).
+#
+# The orchestrator, built-in agents, and native subagents are pinned to one model
+# by an inline highest-precedence config. The default is opencode-go/ox-alpha-free.
+# The default worker scope is OpenCode-only, making the whole run free while the
+# promotion is active. Use --workers all only when intentionally opting into the
+# Claude/Codex/Kimi pools too.
+#
+# Usage:
+#   ocmax                         least-busy OpenCode account; OpenCode-only workers
+#   ocmax N                       pin OpenCode account N
+#   ocmax --workers all           OX orchestrator; all five worker engines
+#   ocmax --workers codex,kimi    arbitrary comma/plus-separated worker subset
+#   ocmax --orchestrator          use reserved ~/.opencode-orch (set up: ocx orch)
+#   ocmax resume [session-id]     resume an OpenCode session from its owning profile
+#   ocmax status                  unified fleet status
+#   ocmax portal [port]           universal Claude + Codex + OpenCode + Kimi dashboard
+#   ocmax "initial task"          launch with an initial prompt
+set -u
+
+OPEN_CODE_BIN="${NEOMAX_OPENCODE_BIN:-opencode}"
+OX_MODEL="opencode-go/ox-alpha-free"
+OPENCODE_MODEL="${NEOMAX_OPENCODE_MODEL:-$OX_MODEL}"
+CLAUDE_WORKER_MODEL="${NEOMAX_CLAUDE_MODEL:-claude-fable-5[1m]}"
+CODEX_WORKER_MODEL="${NEOMAX_CODEX_MODEL:-gpt-5.6-sol}"
+KIMI_WORKER_MODEL="${NEOMAX_KIMI_MODEL:-kimi-code/k3}"
+GROK_WORKER_MODEL="${NEOMAX_GROK_MODEL:-grok-4.6}"
+SELF_DIR="${0:A:h}"
+OX_CONFIG="$SELF_DIR/../opencode/model-policy.json"
+DEFAULT_PROFILE="$HOME/.opencode"
+PROFILES=("$DEFAULT_PROFILE" $HOME/.opencode-acct<2->(Nn/))
+
+acct_num() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then print 1
+  elif [[ "$1" == *-orch ]]; then print orch
+  else print "${1##*-acct}"
+  fi
+}
+profile_for() { if (( $1 == 1 )); then print "$DEFAULT_PROFILE"; else print "$HOME/.opencode-acct$1"; fi }
+auth_path() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then print "$HOME/.local/share/opencode/auth.json"
+  else print "$1/opencode/auth.json"
+  fi
+}
+logged_in() {
+  python3 - "$(auth_path "$1")" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    raise SystemExit(0 if any(isinstance(v, dict) and v.get("key") for v in data.values()) else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+ensure_profile() { [[ "$1" == "$DEFAULT_PROFILE" ]] || mkdir -p "$1"; }
+set_profile_env() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then unset XDG_DATA_HOME
+  else export XDG_DATA_HOME="$1"
+  fi
+}
+apply_model_policy() {
+  if [[ ! -r "$OX_CONFIG" ]]; then print "ocmax: OpenCode policy template missing: $OX_CONFIG" >&2; return 1; fi
+  local content
+  content="$(python3 - "$OX_CONFIG" "$OX_MODEL" "$OPENCODE_MODEL" <<'PY'
+import json, sys
+path, default_model, model = sys.argv[1:]
+try:
+    with open(path) as f:
+        data = json.load(f)
+    agents = data.get("agent") or {}
+    required = {"build", "plan", "general", "explore", "scout",
+                "compaction", "title", "summary"}
+    ok = (data.get("model") == default_model and data.get("small_model") == default_model
+          and data.get("enabled_providers") == ["opencode-go"]
+          and data.get("share") == "disabled" and set(agents) == required
+          and all((cfg or {}).get("model") == default_model for cfg in agents.values()))
+    if not ok:
+        raise ValueError("base policy template is invalid")
+    provider, sep, model_id = model.partition("/")
+    if not sep or not provider or not model_id:
+        raise ValueError("model must use provider/model form")
+    data["model"] = data["small_model"] = model
+    data["enabled_providers"] = [provider]
+    for cfg in agents.values(): cfg["model"] = model
+    print(json.dumps(data, separators=(",", ":")))
+except Exception as exc:
+    print("ocmax: refusing OpenCode launch — invalid model policy: %s" % exc,
+          file=sys.stderr)
+    raise SystemExit(2)
+PY
+  )" || return $?
+  export OPENCODE_CONFIG_CONTENT="$content"
+  export OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_SHARE=1 OPENCODE_AUTO_SHARE=false
+}
+orchestrator_opener() { command neomax orient 2>/dev/null; }
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import glob, json, os, sys
+profile=sys.argv[1]; n=0
+for path in glob.glob(os.path.expanduser("~/.neomax/runs/*.json")):
+    try:
+        rec=json.load(open(path))
+        if rec.get("engine")=="opencode" and rec.get("profile")==profile and rec.get("status")=="running":
+            os.kill(int(rec.get("worker_pid")), 0); n += 1
+    except Exception: pass
+print(n)
+PY
+}
+
+launch_portal() {
+  local portal="${NEOMAX_PORTAL_BIN:-}"
+  if [[ -z "$portal" && -x "$SELF_DIR/neomax-portal" ]]; then portal="$SELF_DIR/neomax-portal"
+  elif [[ -z "$portal" ]] && command -v neomax-portal >/dev/null 2>&1; then portal="neomax-portal"
+  fi
+  [[ -n "$portal" ]] || { print "ocmax: neomax-portal not found" >&2; return 1; }
+  exec "$portal" "$@"
+}
+
+if [[ "${1:-}" == "portal" ]]; then
+  shift; launch_portal "$@"
+fi
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- 'usage: ocmax [ACCOUNT] [--workers SCOPE] [--model PROVIDER/MODEL] [INITIAL_TASK...]
+       ocmax --orchestrator [--workers SCOPE] [--model PROVIDER/MODEL]
+       ocmax resume [SESSION_ID] [--model PROVIDER/MODEL]
+       ocmax status | portal [PORT]
+
+OpenCode defaults to opencode-go/ox-alpha-free. List qualified IDs with `ocx models`.
+Every --ENGINE-model MODEL flag sets that delegated worker pool.'
+  exit 0
+fi
+
+if [[ "${1:-}" == "status" ]]; then
+  local neomax_bin=""
+  if [[ -x "$SELF_DIR/neomax" ]]; then neomax_bin="$SELF_DIR/neomax"
+  elif command -v neomax >/dev/null 2>&1; then neomax_bin="neomax"
+  fi
+  [[ -n "$neomax_bin" ]] && exec "$neomax_bin" status
+  print "neomax not found"; exit 1
+fi
+
+local fleet="opencode" want_orch=0; local newargs=()
+while (( $# )); do
+  case "$1" in
+    --workers) fleet="${2:-opencode}"; shift 2;;
+    --workers=*) fleet="${1#--workers=}"; shift;;
+    --orchestrator) want_orch=1; shift;;
+    --model|--opencode-model) OPENCODE_MODEL="$2"; shift 2;;
+    --model=*|--opencode-model=*) OPENCODE_MODEL="${1#*=}"; shift;;
+    --claude-model) CLAUDE_WORKER_MODEL="$2"; shift 2;;
+    --claude-model=*) CLAUDE_WORKER_MODEL="${1#*=}"; shift;;
+    --codex-model) CODEX_WORKER_MODEL="$2"; shift 2;;
+    --codex-model=*) CODEX_WORKER_MODEL="${1#*=}"; shift;;
+    --kimi-model) KIMI_WORKER_MODEL="$2"; shift 2;;
+    --kimi-model=*) KIMI_WORKER_MODEL="${1#*=}"; shift;;
+    --grok-model) GROK_WORKER_MODEL="$2"; shift 2;;
+    --grok-model=*) GROK_WORKER_MODEL="${1#*=}"; shift;;
+    *) newargs+=("$1"); shift;;
+  esac
+done
+set -- "${newargs[@]}"
+python3 - "$fleet" <<'PY' || { print "ocmax: --workers must be all or a comma/plus list of claude,codex,opencode,kimi,grok" >&2; exit 2; }
+import re, sys
+p = {x for x in re.split(r"[,+]", sys.argv[1]) if x}
+raise SystemExit(0 if sys.argv[1] == "all" or (p and p <= {"claude","codex","opencode","kimi","grok"}) else 1)
+PY
+if [[ "${1:-}" == "portal" ]]; then shift; launch_portal "$@"; fi
+if [[ "${1:-}" == "status" ]]; then exec "$0" status "${@:2}"; fi
+export NEOMAX_FLEET="$fleet" NEOMAX_ROLE="opencode" NEOMAX_PROJECT_ROOT="$PWD"
+export NEOMAX_CLAUDE_MODEL="$CLAUDE_WORKER_MODEL" NEOMAX_CODEX_MODEL="$CODEX_WORKER_MODEL"
+export NEOMAX_OPENCODE_MODEL="$OPENCODE_MODEL" NEOMAX_KIMI_MODEL="$KIMI_WORKER_MODEL"
+export NEOMAX_GROK_MODEL="$GROK_WORKER_MODEL"
+export NEOMAX_ORCH_SESSION="orch-opencode-$$-$(date +%s)" NEOMAX_ORCH_PID=$$
+_register_orch() { command neomax orch-register 2>/dev/null || true; }
+apply_model_policy || exit 1
+
+launch_tui() {
+  local prof="$1"; shift
+  set_profile_env "$prof"
+  local args=("$PWD" --model "$OPENCODE_MODEL" --agent build --auto)
+  if (( $# == 0 )); then
+    local op="$(orchestrator_opener)"
+    [[ -n "$op" ]] && args+=(--prompt "$op")
+  elif [[ "$1" == -* ]]; then
+    args+=("$@")
+  else
+    args+=(--prompt "$*")
+  fi
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: opencode $PWD --model $OPENCODE_MODEL --agent build --auto${args[(I)--prompt]:+ --prompt <initial-prompt>}"
+    return 0
+  fi
+  _register_orch
+  exec "$OPEN_CODE_BIN" "${args[@]}"
+}
+
+if (( want_orch )); then
+  local prof="$HOME/.opencode-orch"
+  if ! logged_in "$prof"; then
+    print "ocmax: no dedicated OpenCode orchestrator account — set it up first: ocx orch"; exit 1
+  fi
+  export NEOMAX_ORCH_RESERVED=1
+  print "ocmax → DEDICATED OpenCode orchestrator ($prof, RESERVED) · model=$OPENCODE_MODEL · workers=$fleet"
+  launch_tui "$prof" "$@"
+  exit $?
+fi
+
+if [[ "${1:-}" == "resume" || "${1:-}" == "--resume" ]]; then
+  shift
+  local rid=""
+  [[ -n "${1:-}" && "${1:-}" != -* ]] && { rid="$1"; shift; }
+  local loc
+  loc=$(python3 - "$OPEN_CODE_BIN" "$rid" <<'PY'
+import glob, json, os, subprocess, sys
+binary, wanted = sys.argv[1:]
+home = os.path.expanduser("~")
+profiles = [os.path.join(home, ".opencode")] + sorted(glob.glob(os.path.join(home, ".opencode-acct*")))
+orch = os.path.join(home, ".opencode-orch")
+if os.path.isdir(orch): profiles.append(orch)
+best = None
+for profile in profiles:
+    env = dict(os.environ)
+    if profile == os.path.join(home, ".opencode"):
+        env.pop("XDG_DATA_HOME", None)
+    else:
+        env["XDG_DATA_HOME"] = profile
+    try:
+        run = subprocess.run([binary, "session", "list", "--format", "json", "-n", "200"],
+                             env=env, capture_output=True, text=True, timeout=15)
+        rows = json.loads(run.stdout) if run.returncode == 0 else []
+    except Exception:
+        continue
+    for row in rows if isinstance(rows, list) else []:
+        sid = row.get("id") or ""
+        if wanted and (sid == wanted or (len(wanted) >= 8 and sid.startswith(wanted))):
+            print(profile + "\t" + sid); raise SystemExit(0)
+        stamp = ((row.get("time") or {}).get("updated") or (row.get("time") or {}).get("created")
+                 or row.get("updated") or row.get("created") or 0)
+        if not wanted and (best is None or stamp > best[0]): best = (stamp, profile, sid)
+if not wanted and best:
+    print(best[1] + "\t" + best[2]); raise SystemExit(0)
+raise SystemExit(1)
+PY
+  ) || { print "ocmax: session ${rid:-<most recent>} not found in any OpenCode profile"; exit 1; }
+  local prof="${loc%%$'\t'*}" sid="${loc##*$'\t'}"
+  print "ocmax → resuming OpenCode session $sid on account $(acct_num "$prof") · model=$OPENCODE_MODEL · workers=$fleet"
+  set_profile_env "$prof"
+  local prompt=""
+  if (( $# == 0 )); then prompt="SYSTEM — the Neomax harness may have changed. Run neomax orient, adopt its current directives, then continue where this session stopped."; else prompt="$*"; fi
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: opencode $PWD --session $sid --model $OPENCODE_MODEL --agent build --auto --prompt <refresh/prompt>"; exit 0
+  fi
+  _register_orch
+  exec "$OPEN_CODE_BIN" "$PWD" --session "$sid" --model "$OPENCODE_MODEL" --agent build --auto --prompt "$prompt"
+fi
+
+local pick=""
+if [[ "${1:-}" == <1-> ]]; then
+  local n="$1"; shift
+  pick="$(profile_for "$n")"; ensure_profile "$pick"
+else
+  pick="$(command neomax pick-orch --engine opencode 2>/dev/null)"
+  if [[ -z "$pick" ]]; then
+    local best=999999 live
+    for prof in "${PROFILES[@]}"; do
+      logged_in "$prof" || continue
+      live="$(count_live "$prof")"
+      if (( live < best )); then pick="$prof"; best="$live"; fi
+    done
+  fi
+  [[ -z "$pick" ]] && pick="$DEFAULT_PROFILE"
+fi
+if ! logged_in "$pick"; then
+  print "ocmax: OpenCode account $(acct_num "$pick") is not logged in — run: ocx login $(acct_num "$pick")"; exit 1
+fi
+print "ocmax → OpenCode orchestrator on account $(acct_num "$pick") ($pick) · model=$OPENCODE_MODEL · workers=$fleet"
+local coloc="$(command neomax orch-on --dir "$pick" --engine opencode 2>/dev/null)"
+if [[ "${coloc:-0}" == <1-> ]]; then
+  print "⚠️  account $(acct_num "$pick") already has $coloc live OpenCode orchestrator(s); prefer a free account."
+fi
+launch_tui "$pick" "$@"

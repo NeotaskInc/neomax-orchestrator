@@ -1,0 +1,243 @@
+#!/bin/zsh
+# cdx — Codex multi-account helper (companion to cmax for the Codex worker pool).
+# Codex accounts are isolated by CODEX_HOME; auth is file-based (~/.codex*/auth.json),
+# so each account is just its own CODEX_HOME dir. Claude stays the orchestrator;
+# these accounts are a headless worker pool driven by `neomax delegate --engine codex`.
+#
+# Usage:
+#   cdx login N         authenticate Codex account N (runs `codex login` for its CODEX_HOME)
+#   cdx N               shorthand for `cdx login N` (mirrors `cmax N`); any N works
+#   cdx run [N] [args]  start a PLAIN interactive Codex session on account N (individual-
+#                       account mode; the codex1/2/3 helpers call this). NOT orchestrator.
+#   cdx status          show each Codex account: logged-in + email + live-session + cooldown
+#   cdx whoami [N]      print the account/plan a profile is logged into (codex, if supported)
+set -u
+
+# Codex profiles: acct 1 = ~/.codex (default), acct N = ~/.codex-acctN. Discovered
+# DYNAMICALLY (glob, numeric sort) so a new account appears with no code edits — the
+# same discovery neomax uses. (N)=nullglob, (n)=numeric sort, (/)=dirs only.
+PROFILES=("$HOME/.codex" $HOME/.codex-acct<2->(Nn/))
+STATE_COOLDOWN="$HOME/.neomax/cooldown.json"
+CODEX_MODEL="${NEOMAX_CODEX_MODEL:-gpt-5.6-sol}"
+
+# Account number ↔ profile path.
+acct_num() { if [[ "$1" == "$HOME/.codex" ]]; then print 1; else print "${1##*-acct}"; fi }
+codex_prof_for() { if (( $1 == 1 )); then print "$HOME/.codex"; else print "$HOME/.codex-acct$1"; fi }
+
+# Create acctN's CODEX_HOME on demand (mirrors install.sh): mkdir + copy config.toml
+# from account 1 (copy, not symlink — config is independent per account). Auth is
+# file-based, so the dir + `codex login` is all a new account needs.
+ensure_codex_profile() {
+  local prof="$1"
+  mkdir -p "$prof"
+  [[ "$prof" != "$HOME/.codex" && -f "$HOME/.codex/config.toml" && ! -f "$prof/config.toml" ]] \
+    && cp "$HOME/.codex/config.toml" "$prof/config.toml"
+  return 0
+}
+
+logged_in() { [[ -f "$1/auth.json" ]]; }
+
+# Identity ("email [plan]") of the ChatGPT account a CODEX_HOME is signed into,
+# decoded from the id_token JWT in auth.json (codex login status prints no email).
+# Reads the file live, so it resolves the moment an account logs in. Empty if unknown.
+codex_identity() {
+  python3 - "$1/auth.json" <<'PY' 2>/dev/null
+import json, sys, base64
+try:
+    d = json.load(open(sys.argv[1]))
+    jwt = (d.get("tokens") or {}).get("id_token") or ""
+    seg = jwt.split(".")
+    if len(seg) >= 2:
+        pad = seg[1] + "=" * (-len(seg[1]) % 4)
+        pl = json.loads(base64.urlsafe_b64decode(pad))
+        em = pl.get("email") or ""
+        plan = (pl.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or ""
+        print(em + (" [" + plan + "]" if plan and em else ""))
+except Exception:
+    pass
+PY
+}
+
+# Canonical ChatGPT account id a CODEX_HOME is signed into (the stable collision key —
+# email can be blank/aliased, account_id can't). Empty if not logged in / unreadable.
+codex_acct_id() {
+  python3 - "$1/auth.json" <<'PY' 2>/dev/null
+import json, sys, base64
+try:
+    d = json.load(open(sys.argv[1]))
+    t = d.get("tokens") or {}
+    aid = t.get("account_id") or ""
+    if not aid:
+        jwt = t.get("id_token") or ""
+        seg = jwt.split(".")
+        if len(seg) >= 2:
+            pad = seg[1] + "=" * (-len(seg[1]) % 4)
+            pl = json.loads(base64.urlsafe_b64decode(pad))
+            aid = (pl.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id") or ""
+    print(aid)
+except Exception:
+    pass
+PY
+}
+
+# Any OTHER logged-in profile already signed into ChatGPT account id $2 (excluding
+# profile $1). Prints "  • account N — email" lines; empty when there's no collision.
+# This is the codex twin of the dashboard's DUPLICATE-LOGIN guard: OpenAI keeps ONE
+# refresh-token family per ChatGPT account, so signing a second profile into the same
+# account ROTATES the token and silently invalidates the first profile's session.
+codex_collisions() {
+  local self="$1" aid="$2" p other_aid
+  [[ -z "$aid" ]] && return 0
+  for p in "$HOME/.codex" $HOME/.codex-acct<2->(Nn/) "$HOME/.codex-orch"(N/); do
+    [[ "$p" == "$self" ]] && continue
+    logged_in "$p" || continue
+    other_aid="$(codex_acct_id "$p")"
+    [[ "$other_aid" == "$aid" ]] && print "  • account $(acct_num "$p") ($p) — $(codex_identity "$p")"
+  done
+}
+
+count_live() {
+  # in-flight codex workers on this CODEX_HOME, counted from the durable neomax
+  # registry (exact; codex's node+native process tree makes ps-counting unreliable).
+  local profile="$1"
+  python3 - "$profile" <<'PY' 2>/dev/null || print 0
+import json, os, sys, glob
+profile = sys.argv[1]
+runs = os.path.expanduser("~/.neomax/runs")
+n = 0
+for f in glob.glob(os.path.join(runs, "*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    if r.get("engine") == "codex" and r.get("profile") == profile and r.get("status") == "running":
+        wp = r.get("worker_pid")
+        try:
+            os.kill(wp, 0); alive = True
+        except Exception:
+            alive = False
+        if alive:
+            n += 1
+print(n)
+PY
+}
+
+# `cdx N` (bare account number) is shorthand for `cdx login N` — mirrors `cmax N`.
+if [[ "${1:-}" == <1-> ]]; then set -- login "$1"; fi
+# `cdx orch` = authenticate the DEDICATED Codex orchestrator account (~/.codex-orch).
+if [[ "${1:-}" == "orch" || "${1:-}" == "orchestrator" ]]; then set -- login orch "${@:2}"; fi
+cmd="${1:-status}"
+
+if [[ "$cmd" == "help" || "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+  print -r -- 'usage: cdx login N|orch
+       cdx N
+       cdx run [N] [--model MODEL] [CODEX_ARGS...]
+       cdx status
+       cdx whoami [N]
+
+gpt-5.6-sol is the default. --model/--codex-model/-m passes another model to Codex.'
+  exit 0
+fi
+
+# `cdx run [N] [args...]` — start a PLAIN interactive Codex session on account N (the
+# Codex counterpart of `claude`/`claude2`/`claude3`: just use a different account, NOT
+# orchestrator mode). Account 1 = ~/.codex. Launched the SAME trusted way every Codex
+# session in this system runs — gpt-5.6-sol by default, fast mode (service_tier=fast), no approval prompts, full access (the
+# Codex equivalent of claude's --dangerously-skip-permissions), so it never stalls
+# asking for permission; its sub-agents inherit the session's model + policy. Any
+# codex args pass through. The `codex1/2/3` shell helpers call this.
+if [[ "$cmd" == "run" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then local n="$2"; shift 2; else local n=1; shift; fi
+  local model="$CODEX_MODEL" runargs=()
+  while (( $# )); do
+    case "$1" in
+      --model|--codex-model|-m) model="$2"; shift 2;;
+      --model=*|--codex-model=*) model="${1#*=}"; shift;;
+      *) runargs+=("$1"); shift;;
+    esac
+  done
+  set -- "${runargs[@]}"
+  local prof="$(codex_prof_for "$n")"
+  if ! logged_in "$prof"; then
+    print "cdx: Codex account $n ($prof) is not logged in — run: cdx login $n"; exit 1
+  fi
+  print "cdx → Codex account $n ($prof)$([[ -n "$(codex_identity "$prof")" ]] && print " — $(codex_identity "$prof")")"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: codex -m $model -c service_tier=fast -a never -s danger-full-access $*"; exit 0; fi
+  CODEX_HOME="$prof" exec command codex -m "$model" -c service_tier=fast -a never -s danger-full-access "$@"
+fi
+
+if [[ "$cmd" == "login" ]]; then
+  local n="${2:-}"
+  if [[ "$n" == "orch" ]]; then
+    local prof="$HOME/.codex-orch"
+  elif [[ -z "$n" || "$n" != <1-> ]]; then
+    print "usage: cdx login N|orch   (1 = ~/.codex, N≥2 = ~/.codex-acctN, orch = dedicated orchestrator)"; exit 2
+  else
+    local prof="$(codex_prof_for "$n")"
+  fi
+  ensure_codex_profile "$prof"   # create + seed config on first use, so any N just works
+  print "cdx → logging in Codex account $n (CODEX_HOME=$prof)"
+  # Heads-up: which ChatGPT accounts the OTHER profiles already hold. OpenAI keeps ONE
+  # refresh-token family per account, so signing THIS profile into an account another
+  # profile already uses silently invalidates that other profile's session. The browser
+  # may still be signed into a previous account — pick a DIFFERENT one for each profile.
+  local existing=""
+  for op in "$HOME/.codex" $HOME/.codex-acct<2->(Nn/); do
+    [[ "$op" == "$prof" ]] && continue
+    logged_in "$op" && existing+="     • account $(acct_num "$op") → $(codex_identity "$op")"$'\n'
+  done
+  if [[ -n "$existing" ]]; then
+    print "     already signed in elsewhere — use a DIFFERENT ChatGPT account here:"
+    printf '%s' "$existing"
+  fi
+  print "     a browser / device-code flow will open; sign in with that account."
+  CODEX_HOME="$prof" command codex login "${@:3}"
+  if logged_in "$prof"; then
+    print "cdx: account $n logged in ✓ — $(codex_identity "$prof")"
+    # Post-login collision guard: did we just sign into an account another profile holds?
+    local new_aid="$(codex_acct_id "$prof")" hits
+    hits="$(codex_collisions "$prof" "$new_aid")"
+    if [[ -n "$hits" ]]; then
+      print ""
+      print "  ⚠️  DUPLICATE LOGIN — account $n is the SAME ChatGPT account as:"
+      print "$hits"
+      print "     OpenAI rotates ONE token family per account, so that profile's session"
+      print "     was just INVALIDATED. Re-login it when you need it (cdx login <that N>),"
+      print "     or sign account $n into a different ChatGPT account to keep both alive."
+    fi
+  else
+    print "cdx: login did not complete"
+  fi
+  exit $?
+fi
+
+if [[ "$cmd" == "whoami" ]]; then
+  local n="${2:-1}" prof="$(codex_prof_for "${2:-1}")"
+  CODEX_HOME="$prof" command codex login status 2>/dev/null \
+    || python3 -c "import json,sys;d=json.load(open('$prof/auth.json'));print('auth_mode:',d.get('auth_mode'),' (tokens present)' if d.get('tokens') else '')" 2>/dev/null \
+    || print "account $n: not logged in"
+  exit 0
+fi
+
+# default: status — baseline fleet (3) PLUS any higher-numbered accounts that exist,
+# so not-yet-created slots still show as a "run: cdx login N" prompt.
+local now=$(date +%s) hi=3 d num
+for d in $HOME/.codex-acct<2->(Nn/); do (( ${d##*-acct} > hi )) && hi="${d##*-acct}"; done
+for (( num=1; num<=hi; num++ )); do
+  local p="$(codex_prof_for "$num")" n=$(count_live "$(codex_prof_for "$num")")
+  local auth="NOT LOGGED IN — run: cdx login $num"
+  if logged_in "$p"; then
+    auth="logged in"
+    local em=$(codex_identity "$p")
+    [[ -n "$em" ]] && auth="logged in — $em"
+    # flag a duplicate ChatGPT account: it shares one token family with the listed
+    # profile(s), so re-logging either one invalidates the other (see `cdx login`).
+    local dups=$(codex_collisions "$p" "$(codex_acct_id "$p")" | sed -n 's/^  • account \([0-9]*\).*/\1/p' | paste -sd, -)
+    [[ -n "$dups" ]] && auth="$auth  ⚠️ DUPLICATE of account $dups (shared token — re-login invalidates the other)"
+  fi
+  local cool=$(python3 -c "import json,sys;print(int(json.load(open('$STATE_COOLDOWN')).get(sys.argv[1],0)))" "$p" 2>/dev/null)
+  if [[ -n "$cool" && "$cool" != "null" && "$cool" -gt "$now" ]]; then
+    auth="$auth, usage-limit cooldown $(( (cool - now) / 60 ))m left"
+  fi
+  print "codex account $num  $p  —  $n live session(s), $auth"
+done

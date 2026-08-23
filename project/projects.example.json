@@ -1,0 +1,12 @@
+{
+  "myproject": {
+    "root": "/absolute/path/to/myproject",
+    "repos": ["."],
+    "branch_prefix": "mypr",
+    "brain": "CLAUDE.md",
+    "agents": "AGENTS.md",
+    "planning": "docs/neomax-orchestrator",
+    "opener": "docs/neomax-orchestrator/ORCHESTRATOR_OPENER.md",
+    "desc": "A short project description"
+  }
+}

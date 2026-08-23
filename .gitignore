@@ -1,0 +1,10 @@
+.DS_Store
+*.bak
+node_modules/
+__pycache__/
+*.pyc
+
+# Private machine and project overrides
+*.local.md
+project/*.local
+project/*.local.json

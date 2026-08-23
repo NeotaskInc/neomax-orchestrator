@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible Neomax defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve Neomax. Redact credentials, account identities, personal paths, and private repository data.
+  - type: input
+    id: version
+    attributes:
+      label: Neomax version or commit
+      placeholder: Commit SHA or release version
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, shell, Python version, and relevant upstream CLI version.
+      placeholder: macOS 15, zsh 5.9, Python 3.12, OpenCode 1.x
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider or surface
+      options:
+        - Universal Neomax launcher
+        - Claude Code
+        - Codex
+        - OpenCode
+        - Kimi Code
+        - Grok Build
+        - Portal or telemetry
+        - Installer or uninstaller
+        - Worktrees or durable runs
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the minimal commands and sanitized setup needed to reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste only the narrow relevant output. Remove secrets, identities, personal paths, and private source.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and private or personally identifying information.
+          required: true
+        - label: This is not a vulnerability that should use private security reporting.
+          required: true

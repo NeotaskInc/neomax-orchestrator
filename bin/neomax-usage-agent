@@ -1,0 +1,69 @@
+#!/bin/zsh
+# neomax-usage-agent — install/uninstall the launchd agent that runs the token-usage
+# watcher AUTOMATICALLY (on login, kept alive), independent of the dashboard or the
+# orchestrator. So usage is always being captured in real time, with nothing to invoke.
+#
+#   neomax-usage-agent install    write + load the LaunchAgent (idempotent)
+#   neomax-usage-agent uninstall  unload + remove it
+#   neomax-usage-agent status     is it loaded / running?
+set -u
+
+LABEL="io.neomax.usagewatch"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LEGACY_LABEL="io.c""max.usagewatch"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+NEOMAX="$(command -v neomax || print "$HOME/.local/bin/neomax")"
+LOG="$HOME/.neomax/usage-watch.log"
+cmd="${1:-status}"
+
+if [[ "$cmd" == "install" ]]; then
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.neomax"
+  if [[ -e "$LEGACY_PLIST" ]]; then
+    launchctl bootout "gui/$UID/$LEGACY_LABEL" 2>/dev/null || launchctl unload -w "$LEGACY_PLIST" 2>/dev/null
+    rm -f "$LEGACY_PLIST"
+  fi
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$NEOMAX</string>
+    <string>usage-watch</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+PLIST
+  # reload cleanly (bootout old, bootstrap new) — works on modern macOS launchd
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+  if launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null; then
+    print "neomax-usage-agent: installed + started ($LABEL)"
+  else
+    launchctl load -w "$PLIST" 2>/dev/null \
+      && print "neomax-usage-agent: installed + started ($LABEL, legacy load)" \
+      || print "neomax-usage-agent: wrote $PLIST but could not load — run: launchctl load -w '$PLIST'"
+  fi
+  exit 0
+fi
+
+if [[ "$cmd" == "uninstall" ]]; then
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null
+  launchctl bootout "gui/$UID/$LEGACY_LABEL" 2>/dev/null || launchctl unload -w "$LEGACY_PLIST" 2>/dev/null
+  rm -f "$PLIST" "$LEGACY_PLIST"
+  print "neomax-usage-agent: uninstalled"
+  exit 0
+fi
+
+# status
+if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+  print "neomax-usage-agent: LOADED — $(launchctl list 2>/dev/null | grep "$LABEL")"
+else
+  print "neomax-usage-agent: not loaded (run: neomax-usage-agent install)"
+fi

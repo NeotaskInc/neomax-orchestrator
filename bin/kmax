@@ -1,0 +1,187 @@
+#!/bin/zsh
+set -u
+
+KIMI_BIN="${NEOMAX_KIMI_BIN:-kimi}"
+KIMI_MODEL="${NEOMAX_KIMI_MODEL:-kimi-code/k3}"
+CLAUDE_WORKER_MODEL="${NEOMAX_CLAUDE_MODEL:-claude-fable-5[1m]}"
+CODEX_WORKER_MODEL="${NEOMAX_CODEX_MODEL:-gpt-5.6-sol}"
+OPENCODE_WORKER_MODEL="${NEOMAX_OPENCODE_MODEL:-opencode-go/ox-alpha-free}"
+GROK_WORKER_MODEL="${NEOMAX_GROK_MODEL:-grok-4.6}"
+SELF_DIR="${0:A:h}"
+DEFAULT_PROFILE="$HOME/.kimi-code"
+PROFILES=("$DEFAULT_PROFILE" $HOME/.kimi-code-acct<2->(Nn/))
+if [[ -x "$SELF_DIR/neomax" ]]; then NEOMAX_BIN="$SELF_DIR/neomax"; else NEOMAX_BIN="neomax"; fi
+
+profile_for() { if (( $1 == 1 )); then print "$DEFAULT_PROFILE"; else print "$HOME/.kimi-code-acct$1"; fi }
+acct_num() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then print 1
+  elif [[ "$1" == *-orch ]]; then print orch
+  else print "${1##*-acct}"
+  fi
+}
+set_profile_env() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then unset KIMI_CODE_HOME
+  else mkdir -p "$1"; export KIMI_CODE_HOME="$1"
+  fi
+}
+logged_in() {
+  python3 - "$1/credentials/kimi-code.json" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    d=json.load(open(sys.argv[1])) or {}
+    raise SystemExit(0 if d.get("access_token") or d.get("refresh_token") else 1)
+except Exception: raise SystemExit(1)
+PY
+}
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import glob,json,os,sys
+n=0
+for p in glob.glob(os.path.expanduser("~/.neomax/runs/*.json")):
+    try:
+        r=json.load(open(p))
+        if r.get("engine")=="kimi" and r.get("profile")==sys.argv[1] and r.get("status")=="running":
+            os.kill(int(r.get("worker_pid")),0); n+=1
+    except Exception: pass
+print(n)
+PY
+}
+launch_portal() {
+  portal="${NEOMAX_PORTAL_BIN:-}"
+  if [[ -z "$portal" && -x "$SELF_DIR/neomax-portal" ]]; then portal="$SELF_DIR/neomax-portal"
+  elif [[ -z "$portal" ]] && command -v neomax-portal >/dev/null 2>&1; then portal="neomax-portal"
+  fi
+  [[ -n "$portal" ]] || { print "kmax: neomax-portal not found" >&2; return 1; }
+  exec "$portal" "$@"
+}
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- 'usage: kmax [ACCOUNT] [--workers SCOPE] [--model MODEL] [INITIAL_TASK...]
+       kmax --orchestrator [--workers SCOPE] [--model MODEL] [INITIAL_TASK...]
+       kmax resume [SESSION_ID] [--workers SCOPE] [--model MODEL]
+       kmax status
+       kmax portal [PORT]
+
+SCOPE is all, one engine, or a comma/plus list of claude,codex,opencode,kimi,grok.
+K3 is the default model; --model/--kimi-model selects another Kimi CLI model.
+Other --ENGINE-model flags set that delegated worker engine’s model.'
+  exit 0
+fi
+if [[ "${1:-}" == "portal" ]]; then shift; launch_portal "$@"; fi
+if [[ "${1:-}" == "status" ]]; then
+  [[ -x "$SELF_DIR/neomax" ]] && exec "$SELF_DIR/neomax" status
+  exec neomax status
+fi
+
+fleet="kimi"; want_orch=0; newargs=()
+while (( $# )); do
+  case "$1" in
+    --workers) fleet="${2:-kimi}"; shift 2;;
+    --workers=*) fleet="${1#--workers=}"; shift;;
+    --orchestrator) want_orch=1; shift;;
+    --model|--kimi-model) KIMI_MODEL="$2"; shift 2;;
+    --model=*|--kimi-model=*) KIMI_MODEL="${1#*=}"; shift;;
+    --claude-model) CLAUDE_WORKER_MODEL="$2"; shift 2;;
+    --claude-model=*) CLAUDE_WORKER_MODEL="${1#*=}"; shift;;
+    --codex-model) CODEX_WORKER_MODEL="$2"; shift 2;;
+    --codex-model=*) CODEX_WORKER_MODEL="${1#*=}"; shift;;
+    --opencode-model) OPENCODE_WORKER_MODEL="$2"; shift 2;;
+    --opencode-model=*) OPENCODE_WORKER_MODEL="${1#*=}"; shift;;
+    --grok-model) GROK_WORKER_MODEL="$2"; shift 2;;
+    --grok-model=*) GROK_WORKER_MODEL="${1#*=}"; shift;;
+    *) newargs+=("$1"); shift;;
+  esac
+done
+set -- "${newargs[@]}"
+python3 - "$fleet" <<'PY' || { print "kmax: --workers must be all or a comma/plus list of claude,codex,opencode,kimi,grok" >&2; exit 2; }
+import re,sys
+p={x for x in re.split(r"[,+]",sys.argv[1]) if x}
+raise SystemExit(0 if sys.argv[1]=="all" or (p and p<={"claude","codex","opencode","kimi","grok"}) else 1)
+PY
+export NEOMAX_FLEET="$fleet" NEOMAX_ROLE="kimi" NEOMAX_PROJECT_ROOT="$PWD"
+export NEOMAX_CLAUDE_MODEL="$CLAUDE_WORKER_MODEL" NEOMAX_CODEX_MODEL="$CODEX_WORKER_MODEL"
+export NEOMAX_OPENCODE_MODEL="$OPENCODE_WORKER_MODEL" NEOMAX_KIMI_MODEL="$KIMI_MODEL"
+export NEOMAX_GROK_MODEL="$GROK_WORKER_MODEL"
+export NEOMAX_ORCH_SESSION="orch-kimi-$$-$(date +%s)" NEOMAX_ORCH_PID=$$
+register_orch() { "$NEOMAX_BIN" orch-register 2>/dev/null || true; }
+
+bootstrap() {
+  prof="$1"; prompt="$2"; set_profile_env "$prof"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: kimi -m $KIMI_MODEL --output-format stream-json --prompt <orchestrator-opener>"
+    print "DRY: kimi -S <session-id> -m $KIMI_MODEL --auto"
+    return 0
+  fi
+  tmp=$(mktemp -t kmax.XXXXXX); trap 'command rm -f "$tmp"' EXIT
+  "$KIMI_BIN" -m "$KIMI_MODEL" --output-format stream-json --prompt "$prompt" >"$tmp"
+  rc=$?
+  (( rc == 0 )) || { print "kmax: Kimi bootstrap failed (exit $rc)" >&2; return $rc; }
+  sid=$(python3 - "$tmp" <<'PY'
+import json,sys
+sid=None
+for line in open(sys.argv[1],errors="replace"):
+    try: e=json.loads(line)
+    except ValueError: continue
+    if e.get("role")=="meta" and e.get("type")=="session.resume_hint": sid=e.get("session_id") or sid
+print(sid or "")
+PY
+  )
+  [[ -n "$sid" ]] || { print "kmax: Kimi did not report a resumable session id" >&2; return 1; }
+  command rm -f "$tmp"; trap - EXIT
+  register_orch
+  exec "$KIMI_BIN" -S "$sid" -m "$KIMI_MODEL" --auto
+}
+
+if [[ "${1:-}" == "resume" || "${1:-}" == "--resume" ]]; then
+  shift; wanted="${1:-}"; [[ -n "$wanted" ]] && shift
+  loc=$(python3 - "$wanted" <<'PY'
+import glob,json,os,sys
+wanted=sys.argv[1]; home=os.path.expanduser("~")
+profiles=[os.path.join(home,".kimi-code")]+sorted(glob.glob(os.path.join(home,".kimi-code-acct*")))
+orch=os.path.join(home,".kimi-code-orch")
+if os.path.isdir(orch): profiles.append(orch)
+best=None
+for profile in profiles:
+    try: lines=open(os.path.join(profile,"session_index.jsonl"))
+    except OSError: continue
+    for line in lines:
+        try: e=json.loads(line)
+        except ValueError: continue
+        sid=e.get("sessionId") or ""; sdir=e.get("sessionDir") or ""
+        try: stamp=os.path.getmtime(os.path.join(sdir,"state.json"))
+        except OSError: stamp=0
+        if wanted and (sid==wanted or (len(wanted)>=8 and sid.startswith(wanted))):
+            print(profile+"\t"+sid); raise SystemExit(0)
+        if not wanted and (best is None or stamp>best[0]): best=(stamp,profile,sid)
+if best: print(best[1]+"\t"+best[2]); raise SystemExit(0)
+raise SystemExit(1)
+PY
+  ) || { print "kmax: session ${wanted:-<most recent>} not found"; exit 1; }
+  prof="${loc%%$'\t'*}"; sid="${loc##*$'\t'}"; set_profile_env "$prof"
+  print "kmax → resuming Kimi session $sid on account $(acct_num "$prof") · $KIMI_MODEL · workers=$fleet"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: kimi -S $sid -m $KIMI_MODEL --auto"; exit 0; fi
+  register_orch
+  exec "$KIMI_BIN" -S "$sid" -m "$KIMI_MODEL" --auto
+fi
+
+if (( want_orch )); then
+  pick="$HOME/.kimi-code-orch"; export NEOMAX_ORCH_RESERVED=1
+  logged_in "$pick" || { print "kmax: no dedicated Kimi orchestrator account — run: kmx orch"; exit 1; }
+elif [[ "${1:-}" == <1-> ]]; then
+  n="$1"; shift; pick="$(profile_for "$n")"
+else
+  pick="$("$NEOMAX_BIN" pick-orch --engine kimi 2>/dev/null)"
+  if [[ -z "$pick" ]]; then
+    best=999999
+    for prof in "${PROFILES[@]}"; do
+      logged_in "$prof" || continue; live="$(count_live "$prof")"
+      if (( live < best )); then pick="$prof"; best=$live; fi
+    done
+  fi
+  [[ -n "$pick" ]] || pick="$DEFAULT_PROFILE"
+fi
+logged_in "$pick" || { print "kmax: Kimi account $(acct_num "$pick") is not logged in — run: kmx login $(acct_num "$pick")"; exit 1; }
+print "kmax → Kimi orchestrator on account $(acct_num "$pick") ($pick) · model=$KIMI_MODEL · workers=$fleet"
+opener="$("$NEOMAX_BIN" orient 2>/dev/null)"
+if (( $# )); then opener+=$'\n\nUSER\047S INITIAL TASK:\n'"$*"; fi
+bootstrap "$pick" "$opener"

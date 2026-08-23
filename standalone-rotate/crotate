@@ -1,0 +1,2339 @@
+#!/usr/bin/env python3
+"""crotate — standalone multi-account /rotate for Claude Code + Codex.
+
+The rotate feature of neomax-orchestrator, extracted to run WITHOUT neomax /
+the orchestrator: store several Claude Max + Codex accounts on one machine and
+swap a live session's account in place (no /login, no OAuth click) when it
+nears its 5-hour or weekly usage limit — manually via /rotate, hands-off via
+an armed per-turn Stop hook, and (for already-rate-limited sessions that can
+never end a turn) via a model-free launchd tick.
+
+Accounts (same isolation scheme as cmax):
+  claude: acct 1 = ~/.claude (CLAUDE_CONFIG_DIR unset), acct N = ~/.claude-acctN
+          (CLAUDE_CONFIG_DIR namespaces the macOS Keychain item per profile)
+  codex:  acct 1 = ~/.codex,  acct N = ~/.codex-acctN  (CODEX_HOME; file auth)
+
+State lives in ~/.crotate (override: CROTATE_HOME) — independent of ~/.neomax.
+Test hooks: CROTATE_PROFILES / CROTATE_CODEX_PROFILES (colon-separated profile
+dirs), CROTATE_NO_KEYCHAIN=1 (skip `security`, file-store only).
+
+Commands:
+  crotate status [--json]                    account board, both engines
+  crotate session-rotate [<acct>...] [--engine claude|codex] [--threshold N]
+                         [--weekly-threshold N] [--arm] [--dry-run]
+                                             the /rotate engine (pure python,
+                                             works even when rate-limited)
+  crotate disarm [--engine E] [--profile P]  clear an armed auto-rotation
+  crotate tick [--active]                    one model-free rotation sweep
+                                             (the launchd agent runs this)
+  crotate usage-hook                         Claude Stop-hook entrypoint
+  crotate login N [--engine claude|codex]    authenticate account N
+  crotate run [--engine E] N [args...]       plain interactive session on account N
+                                             (the claudeN/codexN helpers call this)
+  crotate rotate-auth <dest> --from <src> [--engine E] [--swap]
+  crotate rotate-auth --restore <dest> [--engine E]
+  crotate log                                recent rotations
+  crotate pause N | unpause N [--engine E]   exclude/include an account
+  crotate portal [--port 8787] [--no-open]   read-only localhost dashboard (opens browser)
+"""
+
+import base64
+import datetime
+import fcntl
+import glob as globmod
+import hashlib
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("CROTATE_HOME") or os.path.join(HOME, ".crotate")
+USAGE_DIR = os.path.join(STATE_DIR, "usage")
+COOLDOWN_FILE = os.path.join(STATE_DIR, "cooldown.json")            # profile slot -> reset epoch
+ACCOUNT_COOLDOWN_FILE = os.path.join(STATE_DIR, "account-cooldown.json")  # account key -> reset epoch
+PAUSED_FILE = os.path.join(STATE_DIR, "paused.json")
+ARMED_ROTATE_FILE = os.path.join(STATE_DIR, "armed-rotate.json")
+AUTH_BACKUPS = os.path.join(STATE_DIR, "auth-backups")
+AUTH_ROTATIONS = os.path.join(STATE_DIR, "auth-rotations.jsonl")
+
+DEFAULT_COOLDOWN_S = 30 * 60
+MAX_RESET_HORIZON_S = 7 * 24 * 3600 + 3600
+ARMED_ROTATE_AGE_S = 12 * 3600
+
+# Rotation thresholds (the /rotate defaults; --threshold / --weekly-threshold override)
+ROTATE_5H = float(os.environ.get("CROTATE_5H", "97"))
+ROTATE_7D = float(os.environ.get("CROTATE_7D", "99"))
+SEVEN_D_HARD = 99.0          # >=99% weekly = exhausted; never a rotation target
+ROTATE_5H_CEILING = float(os.environ.get("CROTATE_5H_CEILING", "95"))  # never land here
+LIVE_SPREAD_WEIGHT = 6.0     # an active/claimed candidate costs this many 5h-% points
+WEEKLY_BUCKET_S = 24 * 3600
+WEEKLY_HORIZON_S = 8 * 24 * 3600
+WEEKLY_TIEBREAK_WEIGHT = 1.5
+ROTATE_CLAIM_TTL_S = 120.0
+ROTATE_TICK_ACTIVE_GRACE_S = float(os.environ.get("CROTATE_ROTATE_GRACE", "45"))
+
+# Claude usage API + OAuth refresh (same endpoints/values the live CLI uses)
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_OAUTH_TOKEN_URL = os.environ.get(
+    "CROTATE_OAUTH_TOKEN_URL", "https://platform.claude.com/v1/oauth/token")
+CLAUDE_OAUTH_CLIENT_ID = os.environ.get(
+    "CROTATE_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+CLAUDE_OAUTH_USER_AGENT = os.environ.get("CROTATE_OAUTH_UA", "claude-cli/2.1.56 (external, cli)")
+REFRESH_ATTEMPT_COOLDOWN_S = 120
+USAGE_HTTP_TIMEOUT_S = 8
+USAGE_FRESH_S = 60
+USAGE_STALE_LABEL_S = 300
+USAGE_RL_BACKOFF_S = 120
+USAGE_STALE_OK_S = 24 * 3600
+CODEX_USAGE_FRESH_S = 12
+
+ENGINES = {
+    "claude": {
+        "config_env": "CLAUDE_CONFIG_DIR",
+        "default_dir": os.path.join(HOME, ".claude"),
+        "profile_glob": ".claude-acct*",
+        "default_unset_env": True,
+        "test_env": "CROTATE_PROFILES",
+    },
+    "codex": {
+        "config_env": "CODEX_HOME",
+        "default_dir": os.path.join(HOME, ".codex"),
+        "profile_glob": ".codex-acct*",
+        "default_unset_env": False,
+        "test_env": "CROTATE_CODEX_PROFILES",
+    },
+}
+
+
+def err(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def engine_profiles(engine):
+    """Profile dirs for an engine, account 1 first, acctN sorted numerically.
+    Discovered dynamically by glob — adding an account needs no code change."""
+    cfg = ENGINES[engine]
+    env = os.environ.get(cfg["test_env"])
+    if env:
+        return [os.path.abspath(p) for p in env.split(":") if p]
+
+    def acct_num(path):
+        m = re.search(r"acct(\d+)$", path)
+        return int(m.group(1)) if m else 0
+    extras = sorted(globmod.glob(os.path.join(HOME, cfg["profile_glob"])), key=acct_num)
+    return [cfg["default_dir"]] + extras
+
+
+def _resolve_profile(sel, engine):
+    """Account selector → profile path: N or a literal path."""
+    if isinstance(sel, str) and (sel.startswith("/") or sel.startswith("~")):
+        return os.path.abspath(os.path.expanduser(sel))
+    try:
+        n = int(sel)
+    except (TypeError, ValueError):
+        return None
+    plist = engine_profiles(engine)
+    return plist[n - 1] if 1 <= n <= len(plist) else None
+
+
+def profile_acct_no(profile, engine):
+    plist = engine_profiles(engine)
+    ap = os.path.abspath(profile)
+    for i, p in enumerate(plist):
+        if os.path.abspath(p) == ap:
+            return i + 1
+    return None
+
+
+# ---------- small utils ----------
+
+def to_epoch_seconds(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    while v > 1e11:          # ms/µs → s
+        v /= 1000.0
+    return v
+
+
+def iso_to_epoch(value):
+    e = to_epoch_seconds(value)
+    if e is not None:
+        return e
+    try:
+        s = str(value).strip().replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_reset_epoch(value):
+    v = to_epoch_seconds(value)
+    if v is None:
+        return None
+    now = time.time()
+    if v <= now or v > now + MAX_RESET_HORIZON_S:
+        return None
+    return v
+
+
+def _reset_eta(epoch):
+    if not epoch:
+        return ""
+    secs = epoch - time.time()
+    if secs <= 0:
+        return ""
+    return "~%dd" % round(secs / 86400) if secs >= 86400 else "~%dh" % max(1, round(secs / 3600))
+
+
+def tail_file(path, nbytes):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _atomic_json(path, obj):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _dump_private(path, obj):
+    """0600 file — backups hold plaintext OAuth tokens / codex auth.json."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+
+
+def _locked_update(path, mutate):
+    """flock-guarded read-modify-write of a JSON map file. `mutate(d)` edits in place."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lf = None
+    try:
+        lf = open(path + ".lock", "w")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+    except OSError:
+        lf = None
+    try:
+        try:
+            with open(path) as f:
+                d = json.load(f) or {}
+        except (OSError, ValueError):
+            d = {}
+        mutate(d)
+        try:
+            _atomic_json(path, d)
+        except OSError:
+            pass
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
+            except OSError:
+                pass
+
+
+# ---------- pause / cooldown state ----------
+
+def load_paused():
+    try:
+        with open(PAUSED_FILE) as f:
+            return set(json.load(f) or [])
+    except (OSError, ValueError):
+        return set()
+
+
+def is_paused(profile):
+    return os.path.abspath(profile) in load_paused()
+
+
+def set_paused(profile, paused=True):
+    # paused.json is a LIST (not a map) — its own locked update
+    prof = os.path.abspath(profile)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lf = None
+    try:
+        lf = open(PAUSED_FILE + ".lock", "w")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+    except OSError:
+        lf = None
+    try:
+        cur = load_paused()
+        (cur.add if paused else cur.discard)(prof)
+        try:
+            _atomic_json(PAUSED_FILE, sorted(cur))
+        except OSError:
+            pass
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
+            except OSError:
+                pass
+
+
+def load_cooldowns():
+    try:
+        with open(COOLDOWN_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def set_cooldown(profile, until_epoch):
+    now = time.time()
+    try:
+        until = min(max(now, float(until_epoch)), now + MAX_RESET_HORIZON_S)
+    except (TypeError, ValueError):
+        until = now + DEFAULT_COOLDOWN_S
+    _locked_update(COOLDOWN_FILE, lambda d: d.__setitem__(profile, int(until)))
+
+
+def cooling_down(profile):
+    until = load_cooldowns().get(profile, 0)
+    return until if until > time.time() else 0
+
+
+def clear_cooldown(profile):
+    _locked_update(COOLDOWN_FILE, lambda d: d.pop(profile, None))
+
+
+def _account_cooldowns():
+    try:
+        with open(ACCOUNT_COOLDOWN_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _account_cooled(key):
+    return bool(key) and _account_cooldowns().get(key, 0) > time.time()
+
+
+def _cool_account(key, until):
+    if not key:
+        return
+    _locked_update(ACCOUNT_COOLDOWN_FILE, lambda d: d.__setitem__(key, int(until)))
+
+
+# ---------- credentials: claude (keychain + file) ----------
+
+def keychain_service(profile):
+    """Claude Code's per-CLAUDE_CONFIG_DIR Keychain item name — must match the CLI."""
+    if profile == os.path.join(HOME, ".claude"):
+        return "Claude Code-credentials"
+    h = hashlib.sha256(profile.encode()).hexdigest()[:8]
+    return "Claude Code-credentials-" + h
+
+
+def _no_keychain():
+    return os.environ.get("CROTATE_NO_KEYCHAIN") == "1"
+
+
+def _keychain_blobs(profile):
+    if _no_keychain():
+        return []
+    svc = keychain_service(profile)
+    blobs = []
+    user = os.environ.get("USER")
+    for extra in ([["-a", user]] if user else []) + [[]]:
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-s", svc] + extra + ["-w"],
+                               capture_output=True, text=True, timeout=USAGE_HTTP_TIMEOUT_S)
+            if r.returncode == 0 and r.stdout.strip():
+                blobs.append(r.stdout.strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    return blobs
+
+
+def read_claude_cred_blob(profile):
+    """Newest valid full credential blob (keychain first, else .credentials.json)."""
+    blobs = list(_keychain_blobs(profile))
+    try:
+        with open(os.path.join(profile, ".credentials.json")) as f:
+            blobs.append(f.read().strip())
+    except OSError:
+        pass
+    best, best_exp = None, -1
+    for b in blobs:
+        try:
+            oa = (json.loads(b) or {}).get("claudeAiOauth") or {}
+        except (ValueError, AttributeError):
+            continue
+        if not oa.get("accessToken"):
+            continue
+        exp = to_epoch_seconds(oa.get("expiresAt")) or 0
+        if exp > best_exp:
+            best, best_exp = b, exp
+    return best
+
+
+def write_claude_cred_blob(profile, blob):
+    """Write into BOTH stores (keychain -U + .credentials.json 0600)."""
+    ok = False
+    if not _no_keychain():
+        try:
+            r = subprocess.run(["security", "add-generic-password", "-U",
+                                "-a", os.environ.get("USER") or "",
+                                "-s", keychain_service(profile), "-w", blob],
+                               capture_output=True, text=True, timeout=10)
+            ok = r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    try:
+        path = os.path.join(profile, ".credentials.json")
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(blob)
+        os.replace(tmp, path)
+        ok = True
+    except OSError:
+        pass
+    return ok
+
+
+def _claude_json_path(profile):
+    return (os.path.join(HOME, ".claude.json")
+            if profile == os.path.join(HOME, ".claude")
+            else os.path.join(profile, ".claude.json"))
+
+
+def _read_oauth_account(profile):
+    try:
+        with open(_claude_json_path(profile)) as f:
+            return (json.load(f) or {}).get("oauthAccount") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _write_oauth_account(profile, oa):
+    path = _claude_json_path(profile)
+    try:
+        try:
+            with open(path) as f:
+                d = json.load(f) or {}
+        except (OSError, ValueError):
+            d = {}
+        d["oauthAccount"] = oa
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def _stored_oauth_blob(profile):
+    """(oauth_dict, full_blob_dict) EVEN IF expired — the refresher needs refreshToken."""
+    blobs = list(_keychain_blobs(profile))
+    try:
+        with open(os.path.join(profile, ".credentials.json")) as f:
+            blobs.append(f.read())
+    except OSError:
+        pass
+    best = None
+    for b in blobs:
+        try:
+            full = json.loads(b) or {}
+            oa = full.get("claudeAiOauth") or {}
+        except (ValueError, AttributeError):
+            continue
+        if oa.get("refreshToken"):
+            if best is None or (to_epoch_seconds(oa.get("expiresAt")) or 0) \
+                    > (to_epoch_seconds(best[0].get("expiresAt")) or 0):
+                best = (oa, full)
+    return best if best else (None, None)
+
+
+def claude_oauth_token(profile):
+    """This profile's own non-expired OAuth access token, or None."""
+    blobs = list(_keychain_blobs(profile))
+    try:
+        with open(os.path.join(profile, ".credentials.json")) as f:
+            blobs.append(f.read())
+    except OSError:
+        pass
+    best, best_exp = None, 0
+    for blob in blobs:
+        try:
+            oa = (json.loads(blob) or {}).get("claudeAiOauth") or {}
+        except (ValueError, AttributeError):
+            continue
+        tok = oa.get("accessToken")
+        exp = to_epoch_seconds(oa.get("expiresAt"))
+        if tok and exp and exp > time.time() and exp > best_exp:
+            best, best_exp = tok, exp
+    return best
+
+
+def logged_in(profile, engine="claude"):
+    if engine == "codex":
+        auth = os.path.join(profile, "auth.json")
+        if not os.path.isfile(auth):
+            return False
+        try:
+            with open(auth) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return bool(d.get("OPENAI_API_KEY") or (d.get("tokens") or {}).get("access_token")
+                    or d.get("tokens"))
+    if not _no_keychain():
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password", "-s", keychain_service(profile)],
+                capture_output=True)
+            if r.returncode == 0:
+                return True
+        except FileNotFoundError:
+            pass
+    return os.path.isfile(os.path.join(profile, ".credentials.json"))
+
+
+# ---------- HTTP (module seams so tests can stub) ----------
+
+_SSL_CTX = None
+
+
+def ssl_context():
+    global _SSL_CTX
+    if _SSL_CTX is not None:
+        return _SSL_CTX
+    ctx = ssl.create_default_context()
+    try:
+        has_ca = bool(ctx.cert_store_stats().get("x509_ca"))
+    except Exception:
+        has_ca = True
+    if not has_ca:
+        loc = os.environ.get("SSL_CERT_FILE")
+        if not loc:
+            try:
+                import certifi
+                loc = certifi.where()
+            except Exception:
+                loc = None
+        if loc:
+            try:
+                ctx.load_verify_locations(loc)
+            except Exception:
+                pass
+    _SSL_CTX = ctx
+    return ctx
+
+
+def http_get_json(url, headers, timeout):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def http_post_json(url, payload, headers, timeout):
+    data = json.dumps(payload).encode("utf-8")
+    hdrs = dict(headers or {})
+    hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+# ---------- liveness ----------
+
+def _profile_recently_active(profile, within_s=900):
+    """A transcript/rollout under this profile written within `within_s` → the
+    session is live/working (claude: projects/*/*.jsonl; codex: sessions rollouts)."""
+    now = time.time()
+    pats = (os.path.join(profile, "projects", "*", "*.jsonl"),
+            os.path.join(profile, "sessions", "**", "*.jsonl"))
+    for pat in pats:
+        for f in globmod.iglob(pat, recursive=True):
+            try:
+                if now - os.path.getmtime(f) <= within_s:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+# ---------- live sessions + sub-agents (ambient; ported from neomax) ----------
+# EVERY live session on the machine — any Claude Code window, any Codex window,
+# their Agent-tool fleets and workflows — on ANY profile, no matter who launched it.
+
+AGENT_ACTIVE_WINDOW_S = 240   # a transcript untouched this long is done/parked
+WORKFLOW_RECENT_S = 900       # a workflow journal written within this = in progress
+
+
+def _claude_tail_active(tail):
+    """Is this Claude main session mid-turn? Reverse-scan past trailing METADATA records
+    (bridge-session / mode / ai-title / summary …) to the last REAL turn event: an
+    assistant message ends the turn iff stop_reason == end_turn; a user record (typed
+    prompt or tool_result) means a turn is in flight. Unknown → not active."""
+    for line in reversed(tail.strip().split("\n")):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        t = e.get("type")
+        if t == "assistant":
+            return (e.get("message") or {}).get("stop_reason") != "end_turn"
+        if t == "user":
+            return True
+        # metadata / summary / snapshot records → keep scanning back
+    return False
+
+
+def _codex_tail_active(tail):
+    """Is this Codex session mid-task? Reverse-scan to the last decisive event:
+    task_complete/turn-end → idle; task_started/user_message/exec/item events →
+    working. token_count / session_meta / response_item etc. are skipped."""
+    IDLE = ("task_complete", "turn.completed", "turn.failed", "turn_aborted",
+            "shutdown_complete", "session_end")
+    BUSY = ("task_started", "turn.started", "user_message", "exec_command_begin",
+            "exec_approval_request", "item.started", "item.updated",
+            "agent_reasoning_delta", "agent_message_delta", "mcp_tool_call_begin")
+    for line in reversed(tail.strip().split("\n")):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        p = e.get("payload") or {}
+        t = p.get("type") or e.get("type")
+        if t in IDLE:
+            return False
+        if t in BUSY:
+            return True
+    return False
+
+
+def _codex_session_live(tail):
+    """Is this Codex session LIVE (window open / autonomously working)? LOOSER than
+    _codex_tail_active's 'mid-turn': a finished turn does NOT end the session — only an
+    explicit session_end / shutdown_complete means it's gone. Paired with the mtime gate
+    at the call site."""
+    for line in reversed(tail.strip().split("\n")):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        p = e.get("payload") or {}
+        t = p.get("type") or e.get("type")
+        if not t:
+            continue
+        return t not in ("shutdown_complete", "session_end")
+    return False
+
+
+def _claude_head_meta(head):
+    """cwd/branch/slug + a task label from a Claude transcript head: the FIRST record
+    carrying cwd (compacted sessions open with summary lines that have none), and the
+    first real typed user message (skipping caveats / command / system-reminder noise)."""
+    meta = {"cwd": None, "branch": None, "slug": None, "label": None}
+    for line in head.split("\n"):
+        if meta["cwd"] and meta["label"]:
+            break
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not meta["cwd"] and e.get("cwd"):
+            meta["cwd"] = e.get("cwd")
+            meta["branch"] = e.get("gitBranch")
+            meta["slug"] = e.get("slug")
+        if not meta["label"] and e.get("type") == "user":
+            c = (e.get("message") or {}).get("content")
+            if isinstance(c, list):
+                c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("text")), None)
+            txt = " ".join(str(c or "").split())
+            if txt and not txt.startswith(("Caveat:", "<command-", "<local-command",
+                                           "<system-reminder", "<task-notification")):
+                meta["label"] = txt[:110]
+    return meta
+
+
+def _codex_head_meta(head):
+    """cwd + a task label (first user_message) from a Codex rollout head."""
+    meta = {"cwd": None, "branch": None, "slug": None, "label": None}
+    for line in head.split("\n"):
+        if meta["cwd"] and meta["label"]:
+            break
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        p = e.get("payload") or {}
+        if not meta["cwd"] and (p.get("cwd") or e.get("cwd")):
+            meta["cwd"] = p.get("cwd") or e.get("cwd")
+        if not meta["label"] and p.get("type") == "user_message":
+            txt = " ".join(str(p.get("message") or "").split())
+            if txt:
+                meta["label"] = txt[:110]
+    return meta
+
+
+def ambient_agent_details(profile, engine="claude"):
+    """Details of every sub-agent ACTIVE on this account right now, from their transcripts
+    on disk — regardless of who spawned them (an interactive session's Agent-tool fleet or
+    a workflow). Sub-agents run in-process (pgrep can't see them) but each appends to its
+    own projects/<proj>/<session>/subagents/**/agent-*.jsonl as it works. Active = written
+    within AGENT_ACTIVE_WINDOW_S AND its last event isn't a final end_turn assistant turn;
+    every agent of an IN-PROGRESS workflow (journal written within WORKFLOW_RECENT_S) stays
+    visible with `working`/`done` flags. Codex has no per-agent transcripts → []."""
+    if engine != "claude":
+        return []
+    now = time.time()
+    out = []
+    wf_recent = {}                     # wf dir -> its journal was written recently
+
+    def _wf_of(path):
+        mm = re.search(r"(.*/subagents/workflows/(wf_[^/]+))/", path)
+        if not mm:
+            return None, False
+        d, wfid = mm.group(1), mm.group(2)
+        if d not in wf_recent:
+            try:
+                wf_recent[d] = (now - os.path.getmtime(os.path.join(d, "journal.jsonl"))) <= WORKFLOW_RECENT_S
+            except OSError:
+                wf_recent[d] = False
+        return wfid, wf_recent[d]
+    for f in globmod.iglob(os.path.join(profile, "projects", "**", "subagents", "**",
+                                        "*.jsonl"), recursive=True):
+        if os.path.basename(f) == "journal.jsonl":
+            continue                   # the workflow's own journal, not an agent transcript
+        try:
+            age = now - os.path.getmtime(f)
+        except OSError:
+            continue
+        wf, wf_active = _wf_of(f)
+        if age > AGENT_ACTIVE_WINDOW_S and not wf_active:
+            continue
+        try:
+            size = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                head = fh.read(8192).decode("utf-8", "replace")
+                fh.seek(max(0, size - 4096))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        last = None
+        for line in tail.strip().split("\n"):
+            try:
+                last = json.loads(line)
+            except ValueError:
+                pass
+        msg = (last or {}).get("message") or {}
+        done = ((last or {}).get("type") == "assistant" and msg.get("stop_reason") == "end_turn")
+        if done and not wf_active:
+            continue                   # a finished standalone agent → skip
+        working = (age <= AGENT_ACTIVE_WINDOW_S) and not done
+        first = {}
+        try:
+            first = json.loads(head.split("\n", 1)[0])
+        except ValueError:
+            pass
+        c = (first.get("message") or {}).get("content")
+        if isinstance(c, list):
+            c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("text")), "")
+        label = " ".join(str(c or "").split())[:90]
+        # this sub-agent's OWN tokens (in/out/cache) summed from its transcript — the only
+        # per-agent source (sub-agents share the parent's sessionId)
+        tin = tout = tcache = 0
+        try:
+            with open(f, "rb") as fh:
+                for raw in fh:
+                    if b'"usage"' not in raw or b'"assistant"' not in raw:
+                        continue
+                    try:
+                        uu = (json.loads(raw).get("message") or {}).get("usage") or {}
+                    except (ValueError, AttributeError):
+                        continue
+                    tin += uu.get("input_tokens") or 0
+                    tout += uu.get("output_tokens") or 0
+                    tcache += (uu.get("cache_creation_input_tokens") or 0) + \
+                        (uu.get("cache_read_input_tokens") or 0)
+        except OSError:
+            pass
+        out.append({"session": first.get("sessionId") or os.path.basename(os.path.dirname(
+                        os.path.dirname(f))),
+                    "slug": first.get("slug"), "cwd": first.get("cwd") or "",
+                    "branch": first.get("gitBranch"), "label": label,
+                    "age_s": int(age), "wf": wf, "done": done, "working": working,
+                    "tok": {"in": tin, "out": tout, "cache": tcache}})
+    return out
+
+
+def ambient_main_details(profile, engine="claude"):
+    """MAIN sessions live on this account RIGHT NOW — interactive windows and anything
+    else writing a transcript/rollout, BOTH engines, no matter who launched it. Unlike
+    neomax (which requires Claude mains to be mid-turn because it counts processes
+    separately), crotate shows EVERY session written within AGENT_ACTIVE_WINDOW_S and
+    marks `working` (mid-turn) vs idle; a Codex session additionally must not be closed
+    (an open window rests at task_complete between turns)."""
+    now = time.time()
+    out = []
+    if engine == "claude":
+        pat = os.path.join(profile, "projects", "*", "*.jsonl")
+    else:
+        pat = os.path.join(profile, "sessions", "**", "rollout-*.jsonl")
+    for f in globmod.iglob(pat, recursive=(engine != "claude")):
+        try:
+            if now - os.path.getmtime(f) > AGENT_ACTIVE_WINDOW_S:
+                continue
+            size = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                head = fh.read(262144).decode("utf-8", "replace")
+                fh.seek(max(0, size - 65536))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if engine == "codex" and not _codex_session_live(tail):
+            continue
+        working = (_claude_tail_active(tail) if engine == "claude"
+                   else _codex_tail_active(tail))
+        meta = (_claude_head_meta if engine == "claude" else _codex_head_meta)(head)
+        base = os.path.basename(f)[:-6]
+        if engine == "claude":
+            sess = base                                       # filename IS the session id
+        else:
+            sess = base[-36:] if len(base) >= 36 else base    # rollout-<ts>-<uuid>
+        out.append({"session": sess, "cwd": meta.get("cwd"),
+                    "branch": meta.get("branch"), "slug": meta.get("slug"),
+                    "label": meta.get("label"), "working": working,
+                    "age_s": int(now - os.path.getmtime(f))})
+    return out
+
+
+def profile_sessions(profile, engine):
+    """Live sessions on ONE profile with their sub-agent fleets attached. Every active
+    MAIN gets a row (even with no sub-agents); sub-agents attach to their session; a
+    session whose main is idle but whose sub-agents still run (backgrounded fleets)
+    appears too."""
+    sess_map = {}
+
+    def _sess(sid, src, label=None, working=False):
+        return sess_map.setdefault(sid, {
+            "engine": engine, "account": os.path.basename(profile),
+            "acct_no": profile_acct_no(profile, engine), "session": sid,
+            "slug": src.get("slug"), "cwd": src.get("cwd"),
+            "branch": src.get("branch"), "label": label,
+            "working": bool(working), "age_s": src.get("age_s"), "agents": []})
+    for mn in ambient_main_details(profile, engine):
+        _sess(mn["session"], mn, label=mn.get("label"), working=mn.get("working"))
+    for ag in ambient_agent_details(profile, engine):
+        _sess(ag["session"], ag)["agents"].append(
+            {"label": ag["label"], "age_s": ag["age_s"], "wf": ag.get("wf"),
+             "done": ag.get("done"), "working": ag.get("working"),
+             "tok": ag.get("tok") or {"in": 0, "out": 0, "cache": 0}})
+    return list(sess_map.values())
+
+
+# ---------- claude token refresh + usage ----------
+
+def claude_refresh_token(profile, force=False):
+    """Refresh an idle account's OAuth access token in place (same exchange the CLI
+    does). Returns the new access token, or None on any failure (old creds untouched)."""
+    oa, full = _stored_oauth_blob(profile)
+    if not oa or not oa.get("refreshToken"):
+        return None
+    if not force and _profile_recently_active(profile, within_s=180):
+        return None                       # a live session owns its own refresh
+    att = os.path.join(USAGE_DIR, "refresh-%s.json" % os.path.basename(profile))
+    now = time.time()
+    if not force:
+        try:
+            with open(att) as f:
+                if now - (json.load(f).get("ts") or 0) < REFRESH_ATTEMPT_COOLDOWN_S:
+                    return None
+        except (OSError, ValueError, AttributeError):
+            pass
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        with open(att, "w") as f:
+            json.dump({"ts": int(now)}, f)
+    except OSError:
+        pass
+    try:
+        resp = http_post_json(CLAUDE_OAUTH_TOKEN_URL, {
+            "grant_type": "refresh_token",
+            "refresh_token": oa["refreshToken"],
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        }, {"Content-Type": "application/json", "Accept": "application/json",
+            "User-Agent": CLAUDE_OAUTH_USER_AGENT}, USAGE_HTTP_TIMEOUT_S)
+    except Exception:
+        return None
+    new_access = (resp or {}).get("access_token") if isinstance(resp, dict) else None
+    if not new_access:
+        return None
+    new_oa = dict(oa)
+    new_oa["accessToken"] = new_access
+    if resp.get("refresh_token"):
+        new_oa["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"):
+        new_oa["expiresAt"] = int((now + float(resp["expires_in"])) * 1000)
+    new_full = dict(full or {})
+    new_full["claudeAiOauth"] = new_oa
+    if not write_claude_cred_blob(profile, json.dumps(new_full)):
+        return None
+    try:
+        os.remove(os.path.join(USAGE_DIR, "claude-%s.json" % os.path.basename(profile)))
+    except OSError:
+        pass
+    return new_access
+
+
+def _claude_local_identity(profile):
+    oa = _read_oauth_account(profile)
+    return {"email": oa.get("emailAddress") or "", "name": oa.get("displayName") or "",
+            "uuid": oa.get("accountUuid") or ""}
+
+
+def fetch_claude_usage(profile):
+    """Current 5h/7d usage from the OAuth usage API with this account's OWN token.
+    Cached; serves the last good same-account reading through transient failures.
+    {"five_hour":{used_percent,resets_at},"seven_day":{...},...} or {"expired":...}
+    or None. Never raises."""
+    cache = os.path.join(USAGE_DIR, "claude-%s.json" % os.path.basename(profile))
+    now = time.time()
+    acct_uuid = _claude_local_identity(profile).get("uuid") or ""
+    cached = None
+    try:
+        with open(cache) as f:
+            d = json.load(f)
+        if d.get("source") == "claude-api" and d.get("observed_at") \
+                and (not acct_uuid or d.get("acct_uuid", acct_uuid) == acct_uuid):
+            cached = d
+            if now - d["observed_at"] < USAGE_FRESH_S:
+                return d
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    def fallback():
+        if cached and now - cached["observed_at"] < USAGE_STALE_OK_S:
+            if now - cached["observed_at"] > USAGE_STALE_LABEL_S:
+                return dict(cached, stale=True)
+            return dict(cached)
+        return None
+
+    token = claude_oauth_token(profile) or claude_refresh_token(profile)
+    if not token:
+        oa, _full = _stored_oauth_blob(profile)
+        has_refresh = bool(oa and oa.get("refreshToken"))
+        return {"expired": True, "recoverable": has_refresh} if (cached or has_refresh) else None
+    if cached and cached.get("rl_until", 0) > now:
+        return fallback()
+    d = None
+    for attempt in (1, 2):
+        try:
+            d = http_get_json(CLAUDE_USAGE_URL, {
+                "Authorization": "Bearer " + token,
+                "anthropic-beta": "oauth-2025-04-20",
+                "anthropic-version": "2023-06-01",
+            }, USAGE_HTTP_TIMEOUT_S)
+            break
+        except Exception as e:
+            if getattr(e, "code", None) == 429:
+                if cached:
+                    try:
+                        with open(cache, "w") as f:
+                            json.dump(dict(cached, rl_until=now + USAGE_RL_BACKOFF_S), f)
+                    except OSError:
+                        pass
+                return fallback()
+            if attempt == 1:
+                time.sleep(0.4)
+                continue
+            return fallback()
+    if not isinstance(d, dict):
+        return fallback()
+
+    def norm(w):
+        w = w if isinstance(w, dict) else {}
+        return {"used_percent": w.get("utilization"),
+                "resets_at": iso_to_epoch(w.get("resets_at"))}
+    out = {"five_hour": norm(d.get("five_hour")),
+           "seven_day": norm(d.get("seven_day")),
+           "source": "claude-api", "observed_at": int(now), "acct_uuid": acct_uuid}
+    if out["five_hour"]["used_percent"] is None and out["seven_day"]["used_percent"] is None:
+        return fallback()
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        _atomic_json(cache, out)
+    except OSError:
+        pass
+    return out
+
+
+# ---------- codex identity + usage ----------
+
+def codex_identity(profile):
+    """{email, plan, key} decoded from auth.json's id_token JWT. key = the stable
+    account id (falls back to email, then a hash of auth.json)."""
+    out = {"email": "", "plan": "", "key": ""}
+    try:
+        with open(os.path.join(profile, "auth.json")) as f:
+            raw = f.read()
+        d = json.loads(raw)
+    except (OSError, ValueError):
+        return out
+    jwt = (d.get("tokens") or {}).get("id_token") or ""
+    seg = jwt.split(".")
+    if len(seg) >= 2:
+        try:
+            pad = seg[1] + "=" * (-len(seg[1]) % 4)
+            pl = json.loads(base64.urlsafe_b64decode(pad))
+            out["email"] = pl.get("email") or ""
+            auth = pl.get("https://api.openai.com/auth") or {}
+            out["plan"] = auth.get("chatgpt_plan_type") or ""
+            out["key"] = auth.get("chatgpt_account_id") or ""
+        except Exception:
+            pass
+    out["key"] = out["key"] or (d.get("tokens") or {}).get("account_id") or out["email"] \
+        or hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return out
+
+
+def read_codex_window(profile):
+    """Latest token_count rate_limits from the newest rollout under this CODEX_HOME."""
+    sessions = os.path.join(os.path.abspath(profile), "sessions")
+    files = globmod.glob(os.path.join(sessions, "**", "*.jsonl"), recursive=True)
+    if not files:
+        return None
+    rollout = max(files, key=os.path.getmtime)
+    rl = None
+    for chunk in (256 * 1024, 4 * 1024 * 1024):
+        blob = tail_file(rollout, chunk)
+        if not blob:
+            break
+        for line in reversed(blob.split("\n")):
+            if '"token_count"' not in line or '"rate_limits"' not in line:
+                continue
+            try:
+                evt = json.loads(line)
+            except ValueError:
+                continue
+            p = evt.get("payload") or evt
+            if p.get("type") == "token_count" and p.get("rate_limits"):
+                rl = p["rate_limits"]
+                break
+        if rl or len(blob) < chunk:
+            break
+    if not rl:
+        return None
+    prim = rl.get("primary") or {}
+    sec = rl.get("secondary") or {}
+    return {
+        "five_hour": {"used_percent": prim.get("used_percent"),
+                      "resets_at": to_epoch_seconds(prim.get("resets_at"))},
+        "seven_day": {"used_percent": sec.get("used_percent"),
+                      "resets_at": to_epoch_seconds(sec.get("resets_at"))},
+        "source": "codex-rollout",
+    }
+
+
+def fetch_codex_usage(profile):
+    cache = os.path.join(USAGE_DIR, "codex-%s.json" % os.path.basename(profile))
+    now = time.time()
+    cached = None
+    try:
+        with open(cache) as f:
+            d = json.load(f)
+        cached = d
+        if now - (d.get("observed_at") or 0) < CODEX_USAGE_FRESH_S:
+            return d
+    except (OSError, ValueError, AttributeError):
+        pass
+    live = read_codex_window(profile)
+    if not live or (live.get("five_hour") or {}).get("used_percent") is None:
+        return cached
+    live["observed_at"] = int(now)
+    try:
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        _atomic_json(cache, live)
+    except OSError:
+        pass
+    return live
+
+
+# ---------- windows + selection ----------
+
+def usage_window(profile, engine):
+    d = fetch_claude_usage(profile) if engine == "claude" else fetch_codex_usage(profile)
+    if d is None:
+        return 0.0
+    if d.get("expired"):
+        return 100.0
+    five = d.get("five_hour") or {}
+    resets = to_epoch_seconds(five.get("resets_at"))
+    if resets and time.time() >= resets:
+        return 0.0
+    return float(five.get("used_percent") or 0.0)
+
+
+def weekly_window(profile, engine):
+    d = fetch_claude_usage(profile) if engine == "claude" else fetch_codex_usage(profile)
+    if d is None or d.get("expired"):
+        return 0.0
+    sev = d.get("seven_day") or {}
+    resets = to_epoch_seconds(sev.get("resets_at"))
+    if resets and time.time() >= resets:
+        return 0.0
+    return float(sev.get("used_percent") or 0.0)
+
+
+def weekly_reset_at(profile, engine):
+    base = os.path.basename(profile)
+    cache = os.path.join(USAGE_DIR, "%s-%s.json" % (engine, base))
+    try:
+        with open(cache) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("expired"):
+        return None
+    resets = to_epoch_seconds(((d.get("seven_day") or {}).get("resets_at")))
+    if not resets or resets <= time.time():
+        return None
+    return resets
+
+
+def weekly_deadline_tier(profile, engine, now=None):
+    reset = weekly_reset_at(profile, engine)
+    if not reset:
+        return int(WEEKLY_HORIZON_S / WEEKLY_BUCKET_S)
+    now = now if now is not None else time.time()
+    return int(max(0.0, reset - now) / WEEKLY_BUCKET_S)
+
+
+def _rotate_claim_file():
+    return os.path.join(STATE_DIR, "rotation-claims.json")
+
+
+def _rotation_claims():
+    try:
+        with open(_rotate_claim_file()) as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _rotation_claim_count(profile, now=None):
+    now = now if now is not None else time.time()
+    ts = _rotation_claims().get(os.path.abspath(profile))
+    return 1 if ts and (now - ts) < ROTATE_CLAIM_TTL_S else 0
+
+
+def _claim_rotation_target(profile):
+    ap = os.path.abspath(profile)
+    now = time.time()
+    d = {k: v for k, v in _rotation_claims().items() if (now - v) < ROTATE_CLAIM_TTL_S}
+    d[ap] = now
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        _atomic_json(_rotate_claim_file(), d)
+    except OSError:
+        pass
+
+
+def rotation_rank(profile, engine, now=None, include_claims=True):
+    """Sort key (LOWER = better) for picking ONE account to rotate onto. 5h-first,
+    with an anti-herd spread (active session / in-flight claim) and a small
+    weekly-deadline nudge (burn use-it-or-lose-it quota first)."""
+    five = usage_window(profile, engine)
+    over_ceiling = 1 if five >= ROTATE_5H_CEILING else 0
+    contention = (1 if _profile_recently_active(profile) else 0) \
+        + (_rotation_claim_count(profile, now) if include_claims else 0)
+    spread = contention * LIVE_SPREAD_WEIGHT
+    nudge = weekly_deadline_tier(profile, engine, now) * WEEKLY_TIEBREAK_WEIGHT
+    return (over_ceiling, five + spread + nudge, weekly_window(profile, engine))
+
+
+def pick_least_loaded(profiles, engine, now=None):
+    """Pick + CLAIM one account (flock-serialized so concurrent rotations spread)."""
+    profiles = list(profiles)
+    if not profiles:
+        return None
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lf = None
+    try:
+        lf = open(os.path.join(STATE_DIR, "rotation.lock"), "w")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+    except OSError:
+        lf = None
+    try:
+        best = min(profiles, key=lambda p: rotation_rank(p, engine, now=now))
+        _claim_rotation_target(best)
+        return best
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
+            except OSError:
+                pass
+
+
+# ---------- per-engine credential mechanics ----------
+
+def account_key(profile, engine):
+    """Stable identity of the account this profile currently holds."""
+    if engine == "claude":
+        return _read_oauth_account(profile).get("accountUuid") or ""
+    return codex_identity(profile).get("key") or ""
+
+
+def account_email(profile, engine):
+    if engine == "claude":
+        return _read_oauth_account(profile).get("emailAddress") or ""
+    return codex_identity(profile).get("email") or ""
+
+
+def _drop_usage_cache(profile, engine):
+    try:
+        os.remove(os.path.join(USAGE_DIR, "%s-%s.json" % (engine, os.path.basename(profile))))
+    except OSError:
+        pass
+
+
+def _backup_auth(profile, engine):
+    try:
+        os.makedirs(AUTH_BACKUPS, exist_ok=True)
+        os.chmod(AUTH_BACKUPS, 0o700)
+        ts = int(time.time())
+        if engine == "claude":
+            _dump_private(os.path.join(AUTH_BACKUPS, "%d-%s.json" % (ts, os.path.basename(profile))),
+                          {"engine": "claude", "blob": read_claude_cred_blob(profile) or "",
+                           "oauth_account": _read_oauth_account(profile), "ts": ts})
+        else:
+            try:
+                with open(os.path.join(profile, "auth.json")) as f:
+                    blob = f.read()
+            except OSError:
+                blob = ""
+            _dump_private(os.path.join(AUTH_BACKUPS, "%d-%s.json" % (ts, os.path.basename(profile))),
+                          {"engine": "codex", "blob": blob, "ts": ts})
+    except OSError:
+        pass
+
+
+def _swap_claude_auth(profile_a, profile_b):
+    """SWAP two profiles' Claude credentials in place (no /login) — atomic-ish:
+    a failed second write rolls the first back so no duplicate identity is left."""
+    blob_a = read_claude_cred_blob(profile_a)
+    blob_b = read_claude_cred_blob(profile_b)
+    if not blob_a or not blob_b:
+        return False
+    oa_a = _read_oauth_account(profile_a)
+    oa_b = _read_oauth_account(profile_b)
+    os.makedirs(profile_a, exist_ok=True)
+    os.makedirs(profile_b, exist_ok=True)
+    if not write_claude_cred_blob(profile_a, blob_b):
+        return False
+    if not write_claude_cred_blob(profile_b, blob_a):
+        write_claude_cred_blob(profile_a, blob_a)
+        return False
+    if oa_b:
+        _write_oauth_account(profile_a, oa_b)
+    if oa_a:
+        _write_oauth_account(profile_b, oa_a)
+    for prof in (profile_a, profile_b):
+        _drop_usage_cache(prof, "claude")
+    return True
+
+
+def _swap_codex_auth(profile_a, profile_b):
+    """SWAP two CODEX_HOME dirs' auth.json files (0600 preserved)."""
+    ap, bp = os.path.join(profile_a, "auth.json"), os.path.join(profile_b, "auth.json")
+    try:
+        with open(ap) as f:
+            a = f.read()
+        with open(bp) as f:
+            b = f.read()
+    except OSError:
+        return False
+    try:
+        for path, blob in ((ap, b), (bp, a)):
+            fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(blob)
+            os.replace(path + ".tmp", path)
+    except OSError:
+        return False
+    for prof in (profile_a, profile_b):
+        _drop_usage_cache(prof, "codex")
+    return True
+
+
+def swap_auth(profile_a, profile_b, engine):
+    return (_swap_claude_auth if engine == "claude" else _swap_codex_auth)(profile_a, profile_b)
+
+
+def _log_auth_rotation(rec):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(AUTH_ROTATIONS, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def recent_auth_rotations(limit=20):
+    out = []
+    try:
+        with open(AUTH_ROTATIONS) as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out[-limit:]
+
+
+# ---------- armed auto-rotation markers ----------
+
+def _armed_rotate_map():
+    try:
+        with open(ARMED_ROTATE_FILE) as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_armed_rotate(d):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        _atomic_json(ARMED_ROTATE_FILE, d)
+    except OSError:
+        pass
+
+
+def set_armed_rotate(profile, threshold, prefer, weekly_threshold=ROTATE_7D, engine="claude"):
+    d = _armed_rotate_map()
+    ap = os.path.abspath(profile)
+    existing = d.get(ap) or {}
+    d[ap] = {"threshold": threshold, "weekly_threshold": weekly_threshold,
+             "prefer": prefer or [], "engine": engine,
+             "session": existing.get("session"), "ts": int(time.time())}
+    _write_armed_rotate(d)
+
+
+def clear_armed_rotate(profile):
+    d = _armed_rotate_map()
+    if d.pop(os.path.abspath(profile), None) is not None:
+        _write_armed_rotate(d)
+
+
+def armed_rotate_take(profile, session_id):
+    """Claim/refresh an actionable marker for this session; None if not ours/aged."""
+    ap = os.path.abspath(profile)
+    d = _armed_rotate_map()
+    rec = d.get(ap)
+    if not rec or time.time() - rec.get("ts", 0) > ARMED_ROTATE_AGE_S:
+        return None
+    owner = rec.get("session")
+    if owner and session_id and owner != session_id:
+        return None
+    rec["session"] = session_id or owner
+    rec["ts"] = int(time.time())
+    d[ap] = rec
+    _write_armed_rotate(d)
+    return {"threshold": rec.get("threshold", ROTATE_5H),
+            "weekly_threshold": rec.get("weekly_threshold", ROTATE_7D),
+            "prefer": rec.get("prefer") or None,
+            "engine": rec.get("engine", "claude")}
+
+
+# ---------- the rotate engine ----------
+
+def _current_session_profile(engine="claude"):
+    cfg = os.environ.get(ENGINES[engine]["config_env"])
+    return os.path.abspath(cfg) if cfg else os.path.abspath(ENGINES[engine]["default_dir"])
+
+
+def session_rotate(profile=None, threshold=ROTATE_5H, prefer=None, force=False,
+                   dry_run=False, weekly_threshold=ROTATE_7D, engine="claude"):
+    """Rotate a session's profile in place to another account of the same engine by
+    SWAPPING credentials (trade places — no duplicate identities, no /login).
+    force = a manual /rotate (switch now); the armed monitor runs force=False and
+    only swaps at the 5h/weekly threshold. Returns a status string."""
+    profile = profile or _current_session_profile(engine)
+    if not logged_in(profile, engine):
+        return "current profile (%s) not logged in" % os.path.basename(profile)
+    cur_5h = usage_window(profile, engine)
+    cur_7d = weekly_window(profile, engine)
+    cur_key = account_key(profile, engine)
+    cur_email = account_email(profile, engine) or "?"
+    over = cur_5h >= threshold or cur_7d >= weekly_threshold
+    if not over and not force:
+        return ("current %s at %.0f%% 5h / %.0f%% 7d (< %.0f%% / %.0f%%) — no rotation yet"
+                % (cur_email, cur_5h, cur_7d, threshold, weekly_threshold))
+    maxed = over
+    win = (fetch_claude_usage(profile) if engine == "claude" else fetch_codex_usage(profile)) or {}
+    over_7d = cur_7d >= weekly_threshold
+    reset = (win.get("seven_day" if over_7d else "five_hour") or {}).get("resets_at")
+    reset = normalize_reset_epoch(reset) or (time.time() + (7 * 24 * 3600 if over_7d else 3600))
+    # usable OTHER accounts: logged in, different account, not paused/cooled/weekly-maxed
+    cands = []
+    for p in engine_profiles(engine):
+        if os.path.abspath(p) == os.path.abspath(profile) or not logged_in(p, engine) \
+                or is_paused(p):
+            continue
+        key = account_key(p, engine)
+        if not key or key == cur_key or _account_cooled(key) or cooling_down(p):
+            continue
+        if weekly_window(p, engine) >= SEVEN_D_HARD:
+            continue
+        cands.append((p, usage_window(p, engine)))
+    best = best_5h = None
+    pref_paths = [os.path.abspath(pp) for pp in
+                  (_resolve_profile(s, engine) for s in (prefer or [])) if pp]
+    if prefer and not pref_paths and force:
+        return ("requested account(s) [%s] don't exist for %s — no rotation"
+                % (", ".join(str(s) for s in prefer), engine))
+    if pref_paths:
+        by_path = {os.path.abspath(p): (p, w) for (p, w) in cands}
+        for pp in pref_paths:
+            if pp in by_path:
+                best, best_5h = by_path[pp]
+                break
+        if best is None and force:
+            # explicit override: accept a named account even if cooled, if usable
+            for pp in pref_paths:
+                if pp == os.path.abspath(profile) or not logged_in(pp, engine) or is_paused(pp):
+                    continue
+                k = account_key(pp, engine)
+                if not k or k == cur_key or weekly_window(pp, engine) >= SEVEN_D_HARD:
+                    continue
+                best, best_5h = pp, usage_window(pp, engine)
+                break
+        if best is None and force:
+            names = ", ".join(os.path.basename(_resolve_profile(s, engine) or str(s))
+                              for s in prefer)
+            return ("requested account(s) [%s] can't be rotated to (not logged in / already "
+                    "current / paused / weekly-exhausted) — no rotation" % names)
+    if best is None:
+        if not cands:
+            return ("account %s hit %.0f%% but NO other %s account is available "
+                    "(all cooled/paused/maxed) — waiting for a window reset"
+                    % (cur_email, cur_5h, engine))
+        idle = [p for (p, w) in cands if not _profile_recently_active(p)]
+        pool = idle or [p for (p, w) in cands]
+        by_path = {os.path.abspath(p): (p, w) for (p, w) in cands}
+        chosen = pick_least_loaded(pool, engine)
+        best, best_5h = by_path[os.path.abspath(chosen)]
+        # manual /rotate of a still-fresh account: stay put if already on the best target
+        cur_rank = rotation_rank(profile, engine, include_claims=False)
+        if force and not maxed \
+                and rotation_rank(best, engine, include_claims=False) >= cur_rank:
+            busy_better = [(p, w) for (p, w) in cands
+                           if rotation_rank(p, engine, include_claims=False) < cur_rank
+                           and _profile_recently_active(p)]
+            if busy_better:
+                names = ", ".join("%s (%.0f%% 5h)" % (account_email(p, engine)
+                                                      or os.path.basename(p), w)
+                                  for p, w in busy_better)
+                return ("the most-available accounts are BUSY with live sessions [%s] — "
+                        "swapping would pull an account out from under one, so you stay put. "
+                        "You're on the best available IDLE account (%s, %.0f%% 5h). "
+                        "Force a specific one with `/rotate <N>`." % (names, cur_email, cur_5h))
+            return ("already on the most available account — %s (%.0f%% 5h) is the best "
+                    "target, nothing to rotate to. Auto-rotation (if armed) swaps at %.0f%%."
+                    % (cur_email, cur_5h, threshold))
+    new_email = account_email(best, engine) or os.path.basename(best)
+    if dry_run:
+        return ("DRY-RUN: would rotate this session %s (%.0f%% 5h) → %s (%.0f%% 5h) [%s] — "
+                "no swap performed." % (cur_email, cur_5h, new_email, best_5h,
+                                        os.path.basename(best)))
+    _backup_auth(profile, engine)
+    _backup_auth(best, engine)
+    best_7d = weekly_window(best, engine)
+    best_reset = _reset_eta(weekly_reset_at(best, engine))
+    if not swap_auth(profile, best, engine):
+        return "FAILED to swap credentials with %s" % os.path.basename(best)
+    # post-swap: profile holds the fresh target → usable. `best` now holds the spent
+    # account — cool it (key + slot) only if actually spent.
+    clear_cooldown(profile)
+    if maxed:
+        _cool_account(cur_key, reset)
+        set_cooldown(best, reset)
+    else:
+        clear_cooldown(best)
+    _log_auth_rotation({"ts": int(time.time()), "engine": engine,
+                        "dest": os.path.basename(profile), "src": os.path.basename(best),
+                        "from_email": cur_email, "to_email": new_email,
+                        "reason": "/rotate%s SWAP 5h %.0f%%%s" % (
+                            " TO " + os.path.basename(best) if pref_paths else "", cur_5h,
+                            ">=%.0f%%" % threshold if maxed else " (manual)")})
+    if maxed:
+        return ("ROTATED (swapped places) — %s (%.0f%% 5h) ⇄ %s (%.0f%% 5h): this session now "
+                "runs %s; the spent %s moved into %s's slot to cool until reset. Adopts at "
+                "next token refresh (no /login)."
+                % (cur_email, cur_5h, new_email, best_5h, new_email, cur_email,
+                   os.path.basename(best)))
+    return ("ROTATED (swapped places) — now running %s (%.0f%% 5h, %.0f%% 7d%s); %s "
+            "(%.0f%% 5h, still has headroom) moved into %s's slot. Adopts at next token "
+            "refresh (no /login)."
+            % (new_email, best_5h, best_7d,
+               ", weekly resets %s" % best_reset if best_reset else "",
+               cur_email, cur_5h, os.path.basename(best)))
+
+
+_NUMWORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+             "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+
+
+def _parse_account_selectors(tokens):
+    out = []
+    for t in tokens:
+        s = str(t).strip().rstrip(",")
+        low = s.lower()
+        if not low or low in ("account", "accounts", "acct", "accts", "to", "and"):
+            continue
+        if low in _NUMWORDS:
+            out.append(_NUMWORDS[low])
+            continue
+        mwrap = re.match(r"^(?:account|acct)[-_]?(\d+)$", low)
+        if mwrap:
+            out.append(mwrap.group(1))
+            continue
+        out.append(s)
+    return out
+
+
+def cmd_session_rotate(argv):
+    """crotate session-rotate [<acct>...] [--engine claude|codex] [--threshold N]
+    [--weekly-threshold N] [--arm] [--dry-run]"""
+    threshold, weekly_threshold, engine = ROTATE_5H, ROTATE_7D, "claude"
+    positionals = []
+    skip = False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a == "--threshold" and i + 1 < len(argv):
+            try:
+                threshold = float(argv[i + 1])
+            except ValueError:
+                pass
+            skip = True
+        elif a == "--weekly-threshold" and i + 1 < len(argv):
+            try:
+                weekly_threshold = float(argv[i + 1])
+            except ValueError:
+                pass
+            skip = True
+        elif a == "--engine" and i + 1 < len(argv):
+            engine = argv[i + 1]
+            skip = True
+        elif a == "--to" and i + 1 < len(argv):
+            positionals.append(argv[i + 1])
+            skip = True
+        elif a.startswith("-"):
+            continue
+        else:
+            positionals.append(a)
+    if engine not in ENGINES:
+        err("crotate: unknown engine %r" % engine)
+        sys.exit(2)
+    prefer = _parse_account_selectors(positionals)
+    profile = _current_session_profile(engine)
+    msg = session_rotate(profile=profile, threshold=threshold, prefer=prefer or None,
+                         force=True, dry_run="--dry-run" in argv,
+                         weekly_threshold=weekly_threshold, engine=engine)
+    print("rotate: " + msg)
+    if "--arm" in argv:
+        set_armed_rotate(profile, threshold, prefer, weekly_threshold, engine=engine)
+        tgt = (" (preferring %s)" % ", ".join(prefer)) if prefer else ""
+        print("rotate: ARMED — this session auto-rotates at %.0f%% 5h / %.0f%% 7d%s "
+              "(hands-off, no /login: Claude via the per-turn Stop hook, plus the "
+              "crotate launchd tick for a session that's already rate-limited)."
+              % (threshold, weekly_threshold, tgt))
+
+
+def cmd_disarm(argv):
+    engine = "claude"
+    prof = None
+    if "--engine" in argv:
+        engine = argv[argv.index("--engine") + 1]
+    if "--profile" in argv:
+        prof = argv[argv.index("--profile") + 1]
+    profile = os.path.abspath(os.path.expanduser(prof)) if prof \
+        else _current_session_profile(engine)
+    clear_armed_rotate(profile)
+    print("rotate: disarmed %s" % os.path.basename(profile))
+
+
+def cmd_usage_hook(argv):
+    """Claude Code Stop-hook entrypoint: at every turn-end, if this session's profile
+    has an armed marker claimed by (or free for) this session, rotate at the
+    threshold. Always exits 0 — never blocks Claude."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except (ValueError, OSError):
+        payload = {}
+    try:
+        prof = _current_session_profile("claude")
+        armed = armed_rotate_take(prof, payload.get("session_id"))
+        if armed and armed.get("engine", "claude") == "claude":
+            session_rotate(profile=prof, threshold=armed["threshold"],
+                           prefer=armed["prefer"],
+                           weekly_threshold=armed.get("weekly_threshold", ROTATE_7D),
+                           engine="claude")
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def rotation_tick(force_active=False):
+    """Model-free rotation sweep — the safety net for a session that has ALREADY hit
+    its wall (no turn-end → no Stop hook). Rotates every armed profile over its
+    threshold; skips one mid-turn (grace) unless force_active. Never raises."""
+    rotated = 0
+    try:
+        now = time.time()
+        for ap, rec in list(_armed_rotate_map().items()):
+            if not isinstance(rec, dict) or now - rec.get("ts", 0) > ARMED_ROTATE_AGE_S:
+                continue
+            if not force_active and _profile_recently_active(
+                    ap, within_s=ROTATE_TICK_ACTIVE_GRACE_S):
+                continue
+            try:
+                msg = session_rotate(profile=ap, threshold=rec.get("threshold", ROTATE_5H),
+                                     prefer=rec.get("prefer") or None,
+                                     weekly_threshold=rec.get("weekly_threshold", ROTATE_7D),
+                                     engine=rec.get("engine", "claude"))
+                if isinstance(msg, str) and msg.startswith("ROTATED"):
+                    rotated += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return rotated
+
+
+def cmd_tick(argv):
+    n = rotation_tick(force_active="--active" in argv)
+    print("rotate-tick: rotated %d profile(s)" % n)
+
+
+# ---------- rotate-auth (manual copy/swap/restore) ----------
+
+def cmd_rotate_auth(argv):
+    """crotate rotate-auth <dest> --from <src> [--engine claude|codex] [--swap]
+       crotate rotate-auth --restore <dest> [--engine ...]
+       crotate rotate-auth --log"""
+    engine = "claude"
+    if "--engine" in argv:
+        i = argv.index("--engine")
+        engine = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    if engine not in ENGINES:
+        err("crotate: unknown engine %r" % engine)
+        sys.exit(2)
+    swap = "--swap" in argv
+    argv = [a for a in argv if a != "--swap"]
+    if "--log" in argv:
+        for r in recent_auth_rotations():
+            print("%s  %s: %s -> %s (%s)" % (
+                time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0))), r.get("engine"),
+                r.get("from_email") or r.get("dest"), r.get("to_email") or r.get("src"),
+                r.get("reason") or "manual"))
+        return
+    if "--restore" in argv:
+        argv = [a for a in argv if a != "--restore"]
+        dest = _resolve_profile(argv[0], engine) if argv else None
+        if not dest:
+            err("crotate: rotate-auth --restore <dest>")
+            sys.exit(2)
+        backups = sorted(globmod.glob(os.path.join(
+            AUTH_BACKUPS, "*-%s.json" % os.path.basename(dest))))
+        if not backups:
+            err("crotate: no auth backup for %s" % dest)
+            sys.exit(1)
+        with open(backups[-1]) as f:
+            bk = json.load(f)
+        blob = bk.get("blob") or ""
+        if not blob:
+            err("crotate: backup for %s has no credential blob" % dest)
+            sys.exit(1)
+        os.makedirs(dest, exist_ok=True)
+        if engine == "codex":
+            with open(os.path.join(dest, "auth.json"), "w") as f:
+                f.write(blob)
+        else:
+            write_claude_cred_blob(dest, blob)
+            if bk.get("oauth_account"):
+                _write_oauth_account(dest, bk["oauth_account"])
+        _drop_usage_cache(dest, engine)
+        _log_auth_rotation({"ts": int(time.time()), "engine": engine,
+                            "dest": os.path.basename(dest), "src": "RESTORE",
+                            "reason": "restore"})
+        print("rotate-auth: restored %s from %s" % (dest, os.path.basename(backups[-1])))
+        return
+    if "--from" not in argv or not argv:
+        err("crotate: rotate-auth <dest> --from <src> [--engine claude|codex] [--swap]")
+        sys.exit(2)
+    i = argv.index("--from")
+    src_sel = argv[i + 1]
+    dest_sel = [a for a in (argv[:i] + argv[i + 2:]) if not a.startswith("-")]
+    dest = _resolve_profile(dest_sel[0], engine) if dest_sel else None
+    src = _resolve_profile(src_sel, engine)
+    if not dest or not src:
+        err("crotate: cannot resolve dest %r / src %r" % (dest_sel, src_sel))
+        sys.exit(2)
+    if os.path.abspath(dest) == os.path.abspath(src):
+        err("crotate: dest and src are the same profile")
+        sys.exit(2)
+    _backup_auth(dest, engine)
+    _backup_auth(src, engine)
+    if swap:
+        if account_key(dest, engine) and account_key(dest, engine) == account_key(src, engine):
+            err("crotate: dest and src are ALREADY the same account — nothing to swap")
+            sys.exit(2)
+        if not swap_auth(dest, src, engine):
+            err("crotate: FAILED to swap credentials between %s and %s" % (dest, src))
+            sys.exit(1)
+        _log_auth_rotation({"ts": int(time.time()), "engine": engine,
+                            "dest": os.path.basename(dest), "src": os.path.basename(src),
+                            "from_email": account_email(src, engine),
+                            "to_email": account_email(dest, engine),
+                            "reason": "manual (swap)"})
+        print("rotate-auth: SWAPPED %s ⇄ %s. Each live session adopts at its next "
+              "token refresh (no /login)." % (os.path.basename(dest), os.path.basename(src)))
+        return
+    # one-way copy src -> dest
+    if engine == "codex":
+        try:
+            with open(os.path.join(src, "auth.json")) as f:
+                blob = f.read()
+        except OSError:
+            err("crotate: source %s has no auth.json (not logged in)" % src)
+            sys.exit(1)
+        os.makedirs(dest, exist_ok=True)
+        fd = os.open(os.path.join(dest, "auth.json.tmp"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(blob)
+        os.replace(os.path.join(dest, "auth.json.tmp"), os.path.join(dest, "auth.json"))
+    else:
+        blob = read_claude_cred_blob(src)
+        if not blob:
+            err("crotate: source %s has no valid credentials (log it in first)" % src)
+            sys.exit(1)
+        src_oa = _read_oauth_account(src)
+        if src_oa.get("accountUuid") and \
+                src_oa.get("accountUuid") == _read_oauth_account(dest).get("accountUuid"):
+            err("crotate: dest is ALREADY the same account — nothing to rotate")
+            sys.exit(2)
+        os.makedirs(dest, exist_ok=True)
+        if not write_claude_cred_blob(dest, blob):
+            err("crotate: FAILED to write credentials into %s" % dest)
+            sys.exit(1)
+        if src_oa:
+            _write_oauth_account(dest, src_oa)
+    _drop_usage_cache(dest, engine)
+    _log_auth_rotation({"ts": int(time.time()), "engine": engine,
+                        "dest": os.path.basename(dest), "src": os.path.basename(src),
+                        "to_email": account_email(dest, engine), "reason": "manual"})
+    print("rotate-auth: %s now carries %s's credentials. Backup saved; restore with: "
+          "crotate rotate-auth --restore %s%s"
+          % (dest, os.path.basename(src), dest_sel[0],
+             " --engine codex" if engine == "codex" else ""))
+
+
+# ---------- login / profile creation ----------
+
+def ensure_profile(n, engine):
+    """Resolve (and create on demand) acctN's profile dir — mirrors the installer:
+    claude shares account-1's config items by symlink; codex copies config.toml.
+    Resolves through engine_profiles so a stubbed test pool is honored (and never
+    silently extended with real ~/ dirs)."""
+    cfg = ENGINES[engine]
+    plist = engine_profiles(engine)
+    if 1 <= n <= len(plist):
+        prof = plist[n - 1]
+        if n == 1:
+            return prof
+    elif os.environ.get(cfg["test_env"]):
+        err("crotate: no %s account %d in the stubbed profile pool" % (engine, n))
+        sys.exit(2)
+    else:
+        prof = os.path.join(HOME, ".%s-acct%d" % (engine, n))
+    os.makedirs(prof, exist_ok=True)
+    if engine == "claude":
+        for item in ("CLAUDE.md", "settings.json", "commands", "plugins"):
+            srcp = os.path.join(cfg["default_dir"], item)
+            dstp = os.path.join(prof, item)
+            if os.path.exists(srcp) and not os.path.exists(dstp):
+                try:
+                    os.symlink(srcp, dstp)
+                except OSError:
+                    pass
+    else:
+        os.makedirs(os.path.join(prof, "prompts"), exist_ok=True)
+        src_cfg = os.path.join(cfg["default_dir"], "config.toml")
+        dst_cfg = os.path.join(prof, "config.toml")
+        if os.path.isfile(src_cfg) and not os.path.exists(dst_cfg):
+            try:
+                with open(src_cfg) as f:
+                    body = f.read()
+                with open(dst_cfg, "w") as f:
+                    f.write(body)
+            except OSError:
+                pass
+        # share the /rotate codex prompt from account 1 if present
+        p1 = os.path.join(cfg["default_dir"], "prompts", "rotate.md")
+        pn = os.path.join(prof, "prompts", "rotate.md")
+        if os.path.exists(p1) and not os.path.exists(pn):
+            try:
+                os.symlink(p1, pn)
+            except OSError:
+                pass
+    return prof
+
+
+def _parse_run_args(argv):
+    """`run [--engine codex] N [engine args...]` → (engine, n, passthrough).
+    Only tokens BEFORE the account number are ours; everything after N goes to
+    the engine untouched (so `claude3 -r` resumes on account 3)."""
+    engine = "claude"
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--engine" and i + 1 < len(argv):
+            engine = argv[i + 1]
+            i += 2
+            continue
+        try:
+            n = int(a)
+        except ValueError:
+            return engine, None, argv[i:]
+        return engine, n, argv[i + 1:]
+    return engine, None, []
+
+
+def _session_env(n, engine):
+    """Environment for a session on account N: config env set (unset for claude
+    acct 1), stray API-key vars scrubbed so subscription auth is what's used."""
+    cfg = ENGINES[engine]
+    prof = ensure_profile(n, engine)
+    env = dict(os.environ)
+    if n == 1 and cfg["default_unset_env"]:
+        env.pop(cfg["config_env"], None)
+    else:
+        env[cfg["config_env"]] = prof
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+              "OPENAI_API_KEY", "CODEX_API_KEY"):
+        env.pop(k, None)
+    return prof, env
+
+
+def profile_path(n, engine):
+    """Account N's profile dir WITHOUT creating anything (cmd_run's existence check)."""
+    plist = engine_profiles(engine)
+    if 1 <= n <= len(plist):
+        return plist[n - 1]
+    return os.path.join(HOME, ".%s-acct%d" % (engine, n))
+
+
+def cmd_run(argv):
+    """crotate run [--engine claude|codex] N [args...] — start a PLAIN interactive
+    session on account N (the claudeN/codexN shell helpers call this). Extra args
+    pass through to the engine (e.g. `crotate run 3 -r`). An account that was never
+    ADDED (not authenticated) fails cleanly instead of opening a logged-out session
+    — adding an account is explicit: `crotate login N`."""
+    engine, n, rest = _parse_run_args(argv)
+    if engine not in ENGINES:
+        err("crotate: unknown engine %r" % engine)
+        sys.exit(2)
+    if n is None:
+        err("crotate: run [--engine claude|codex] <accountNumber> [engine args...]")
+        sys.exit(2)
+    prof = profile_path(n, engine)
+    if not logged_in(prof, engine):
+        err("crotate: no %s account %d added — authenticate it first: crotate login %d%s"
+            % (engine, n, n, " --engine codex" if engine == "codex" else ""))
+        sys.exit(1)
+    _, env = _session_env(n, engine)
+    binname = "claude" if engine == "claude" else "codex"
+    os.execvpe(binname, [binname] + rest, env)
+
+
+def cmd_login(argv):
+    """crotate login N [--engine claude|codex] — create the profile and launch the
+    engine on it to authenticate (claude: run /login inside; codex: `codex login`)."""
+    engine = "claude"
+    if "--engine" in argv:
+        i = argv.index("--engine")
+        engine = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    if engine not in ENGINES:
+        err("crotate: unknown engine %r" % engine)
+        sys.exit(2)
+    if not argv:
+        err("crotate: login <accountNumber> [--engine claude|codex]")
+        sys.exit(2)
+    try:
+        n = int(argv[0])
+    except ValueError:
+        err("crotate: account must be a number (e.g. crotate login 2)")
+        sys.exit(2)
+    prof, env = _session_env(n, engine)
+    if engine == "codex":
+        print("crotate: codex account %d → %s — running `codex login` (browser flow)" % (n, prof))
+        os.execvpe("codex", ["codex", "login"], env)
+    else:
+        print("crotate: claude account %d → %s — starting Claude Code; run /login inside "
+              "if this profile isn't signed in yet, then exit." % (n, prof))
+        os.execvpe("claude", ["claude"], env)
+
+
+# ---------- status ----------
+
+def gather_status():
+    """The one status source the CLI board and the portal both render."""
+    now = time.time()
+    engines = {}
+    sessions = []
+    for engine in ("claude", "codex"):
+        accounts = []
+        for p in engine_profiles(engine):
+            li = logged_in(p, engine)
+            d = (fetch_claude_usage(p) if engine == "claude" else fetch_codex_usage(p)) \
+                if li else None
+            five = (d or {}).get("five_hour") or {}
+            sev = (d or {}).get("seven_day") or {}
+            key = account_key(p, engine)
+            cool = cooling_down(p) or (_account_cooldowns().get(key, 0)
+                                       if _account_cooled(key) else 0)
+            armed = _armed_rotate_map().get(os.path.abspath(p))
+            if armed and now - armed.get("ts", 0) > ARMED_ROTATE_AGE_S:
+                armed = None
+            sess = profile_sessions(p, engine)
+            sessions.extend(sess)
+            accounts.append({
+                "acct_no": profile_acct_no(p, engine),
+                "profile": p, "name": os.path.basename(p),
+                "logged_in": li,
+                "email": account_email(p, engine),
+                "expired": bool((d or {}).get("expired")),
+                "stale": bool((d or {}).get("stale")),
+                "five_hour_pct": five.get("used_percent"),
+                "five_hour_resets_at": to_epoch_seconds(five.get("resets_at")),
+                "seven_day_pct": sev.get("used_percent"),
+                "seven_day_resets_at": to_epoch_seconds(sev.get("resets_at")),
+                "paused": is_paused(p),
+                "cooldown_until": int(cool) if cool else 0,
+                "active": _profile_recently_active(p, within_s=300),
+                "armed": bool(armed),
+                "armed_threshold": (armed or {}).get("threshold"),
+                "mains": len(sess),
+                "subagents": sum(1 for s in sess
+                                 for a in s["agents"] if a.get("working")),
+            })
+        engines[engine] = accounts
+    sessions.sort(key=lambda s: s.get("age_s") or 0)
+    return {"ts": int(now), "engines": engines, "sessions": sessions,
+            "rotations": recent_auth_rotations(limit=20)}
+
+
+def cmd_status(argv):
+    st = gather_status()
+    if "--json" in argv:
+        print(json.dumps(st, indent=2))
+        return
+    for engine in ("claude", "codex"):
+        print("%s accounts:" % engine.upper())
+        for a in st["engines"][engine]:
+            if not a["logged_in"]:
+                line = "  %s. %-18s NOT LOGGED IN (crotate login %s%s)" % (
+                    a["acct_no"], a["name"], a["acct_no"],
+                    " --engine codex" if engine == "codex" else "")
+                print(line)
+                continue
+            f5 = a["five_hour_pct"]
+            s7 = a["seven_day_pct"]
+            flags = []
+            if a["expired"]:
+                flags.append("TOKEN EXPIRED")
+            if a["paused"]:
+                flags.append("paused")
+            if a["cooldown_until"]:
+                flags.append("cooling %s" % (_reset_eta(a["cooldown_until"]) or "…"))
+            if a["armed"]:
+                flags.append("armed@%.0f%%" % (a["armed_threshold"] or ROTATE_5H))
+            if a["active"]:
+                flags.append("active")
+            if a["stale"]:
+                flags.append("stale")
+            print("  %s. %-18s %-28s 5h %s  7d %s%s%s" % (
+                a["acct_no"], a["name"], a["email"] or "?",
+                ("%3.0f%%" % f5) if f5 is not None else "  ??",
+                ("%3.0f%%" % s7) if s7 is not None else "  ??",
+                ("  resets %s" % _reset_eta(a["five_hour_resets_at"])
+                 if a["five_hour_resets_at"] else ""),
+                ("  [" + ", ".join(flags) + "]") if flags else ""))
+        print()
+    if st["rotations"]:
+        print("recent rotations:")
+        for r in st["rotations"][-8:]:
+            print("  %s  %s: %s -> %s (%s)" % (
+                time.strftime("%m-%d %H:%M", time.localtime(r.get("ts", 0))),
+                r.get("engine"), r.get("from_email") or r.get("dest"),
+                r.get("to_email") or r.get("src"), r.get("reason") or ""))
+
+
+def cmd_pause(argv, paused):
+    engine = "claude"
+    if "--engine" in argv:
+        i = argv.index("--engine")
+        engine = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    sel = argv[0] if argv else None
+    prof = _resolve_profile(sel, engine) if sel else None
+    if not prof:
+        err("crotate: %s <accountNumber> [--engine claude|codex]"
+            % ("pause" if paused else "unpause"))
+        sys.exit(2)
+    set_paused(prof, paused)
+    print("%s %s (%s)" % ("paused" if paused else "unpaused", os.path.basename(prof), engine))
+
+
+# ---------- portal (read-only, stdlib) ----------
+
+# Same look-and-feel as bin/neomax-portal (the reference UI) — CSS + markup ported
+# verbatim, rendering crotate's gather_status() fields instead of neomax's.
+PORTAL_HTML = r"""<!doctype html><html><head><meta charset=utf-8>
+<title>crotate</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0a0a0a;--card:#101010;--card2:#151515;--line:#262626;--line2:#3d3d3d;
+--fg:#f2f2f2;--dim:#979797;--dim2:#646464;--accent:#ff5c00;
+--ok:#c9c9c9;--warn:#ff5c00;--bad:#ff5c00;--track:#1d1d1d;--barfill:#777;--barmid:#cfcfcf;--offdot:#333;--gold:#d4af37}
+/* Light mode — inverted: white bg, black text. Toggled via the header button. */
+:root[data-theme="light"]{--bg:#ffffff;--card:#f7f7f7;--card2:#ededed;--line:#dcdcdc;
+--line2:#bcbcbc;--fg:#0a0a0a;--dim:#555555;--dim2:#888888;--accent:#e24c00;
+--ok:#444444;--warn:#e24c00;--bad:#e24c00;--track:#e3e3e3;--barfill:#8a8a8a;--barmid:#555555;--offdot:#bdbdbd;--gold:#b8860b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:13px/1.45 -apple-system,Inter,system-ui,sans-serif;
+font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1240px;margin:0 auto;padding:20px}
+header{display:flex;justify-content:space-between;align-items:flex-end;
+padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid var(--line);flex-wrap:wrap;gap:8px}
+h1{font-size:15px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin:0}
+.sub{color:var(--dim2);font-size:11px;letter-spacing:.03em;margin-top:3px}
+.refresh{color:var(--dim2);font-size:10px;letter-spacing:.12em;text-transform:uppercase;display:flex;align-items:center;gap:7px}
+.refresh .live{width:7px;height:7px;border-radius:1px;background:var(--accent);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,92,0,.45)}70%{box-shadow:0 0 0 6px rgba(255,92,0,0)}100%{box-shadow:0 0 0 0 rgba(255,92,0,0)}}
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:12px}
+@media(max-width:880px){.stats{grid-template-columns:repeat(3,1fr)}}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:0;padding:10px 12px}
+.tile .v{font-size:22px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
+.tile .l{color:var(--dim2);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;margin-top:4px}
+.tile.accent .v,.tile.warn .v,.tile.bad .v{color:var(--accent)}
+.tile.ok .v{color:var(--fg)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+@media(max-width:880px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:0;padding:13px 14px;margin-bottom:12px}
+.card h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);
+margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid var(--line);
+display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.card h2 .hint{text-transform:none;letter-spacing:.02em;color:var(--dim2);font-size:10.5px;font-weight:400;text-align:right}
+.acct{display:flex;align-items:center;gap:11px;padding:10px 0;border-top:1px solid var(--line)}
+.acct:first-of-type{border-top:none}
+.dot{width:7px;height:7px;border-radius:1px;flex:none}
+.on{background:var(--fg)}.off{background:var(--offdot)}.cool{background:var(--accent)}.dot.paused{background:var(--dim2)}
+.acct.paused{opacity:.55}
+.acct.paused .who .nm::after{content:' · paused';color:var(--dim2);font-weight:400;font-size:10px;letter-spacing:.04em}
+.acct .who{min-width:170px}
+.acct .who .nm{font-weight:600;font-size:12.5px;letter-spacing:.01em}
+.acct .who .em{color:var(--dim2);font-size:11px;overflow:hidden;text-overflow:ellipsis;max-width:170px;white-space:nowrap}
+.acct .use{flex:1;font-size:11.5px;color:var(--dim)}
+.usline{display:flex;align-items:center;gap:8px}.usline+.usline{margin-top:3px}
+.uslbl{width:18px;color:var(--dim2);font-size:9.5px;letter-spacing:.08em}
+.bar{height:5px;border-radius:0;background:var(--track);overflow:hidden;flex:1;max-width:170px}
+.bar.sm{height:3px;max-width:130px}
+.bar>i{display:block;height:100%;background:var(--barfill);transition:width .4s}
+.bar>i.mid{background:var(--barmid)}.bar>i.hi{background:var(--accent)}
+.chip{font-size:10px;padding:1px 6px;border-radius:2px;border:1px solid var(--line2);color:var(--dim);white-space:nowrap;letter-spacing:.02em}
+.chip.plan{border-color:var(--line2);color:var(--fg)}
+.chip.live{border-color:var(--line2);color:var(--dim)}
+.chip.cool{border-color:var(--accent);color:var(--accent)}
+.chip.agents{border-color:var(--line2);color:var(--fg)}
+.chip.paused{border-color:var(--dim2);color:var(--dim2);font-weight:700}
+button{background:transparent;color:var(--dim);border:1px solid var(--line2);border-radius:2px;
+padding:4px 10px;font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+button:hover{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+button.sm{padding:2px 7px;font-size:9.5px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim2);font-weight:600;padding:5px 8px;border-bottom:1px solid var(--line);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:none}
+.eng{font-size:11px;color:var(--dim);white-space:nowrap}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px}
+.muted{color:var(--dim2)}
+.overflow{overflow-x:auto}
+.spin{display:inline-block;width:8px;height:8px;border:1.5px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:sp .8s linear infinite;vertical-align:middle}
+@keyframes sp{to{transform:rotate(360deg)}}
+.modesec{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin:16px 0 4px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+</style></head><body><div class=wrap>
+<header>
+  <div><h1>crotate</h1><div class=sub>standalone multi-account rotate — read-only · <span id=clock></span></div></div>
+  <div class=refresh><button id=themeBtn class=sm title="toggle light / dark">◐ Light</button><span class=live></span> live · refresh 10s</div>
+</header>
+<div class=stats id=stats></div>
+<div class=banner id=authrot style="display:none"></div>
+<div class=grid>
+  <div class=card><h2>Claude accounts <span class=hint id=claudeHint>rotation pool</span></h2><div id=claudeAccts></div></div>
+  <div class=card><h2>Codex accounts <span class=hint id=codexHint>rotation pool</span></h2><div id=codexAccts></div></div>
+</div>
+<div class=card><h2>Tasks in progress <span class=hint id=runningCount></span></h2><div id=active></div></div>
+<div class=card><h2>Auth rotations <span class=hint id=rotCount></span></h2><div class=overflow id=rotations></div></div>
+<script>
+var DATA=null;
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function nowS(){return Math.floor(Date.now()/1000)}
+function fmtAge(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+'s';var m=(sec/60)|0;if(m<60)return m+'m '+(sec%60)+'s';var h=(m/60)|0;if(h<24)return h+'h '+(m%60)+'m';return ((h/24)|0)+'d '+(h%24)+'h'}
+function clockTime(t){var d=new Date(t*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+// reset label: time only if it's today, else weekday + month/day + time (so a 7-day
+// window — days out — shows the date, not just a time).
+function resetLabel(t){var d=new Date(t*1000),n=new Date();
+  if(d.toDateString()===n.toDateString())return clockTime(t);
+  return d.toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}
+function barCls(p){return p>=85?'hi':(p>=60?'mid':'')}
+function tile(v,l,cls){return '<div class="tile '+(cls||'')+'"><div class=v>'+v+'</div><div class=l>'+l+'</div></div>'}
+function fmtTok(n){n=n||0;if(n>=1e9)return +(n/1e9).toFixed(2)+'B';if(n>=1e6)return +(n/1e6).toFixed(1)+'M';if(n>=1000)return +(n/1000).toFixed(1)+'k';return String(n)}
+function fmtTokParts(t){t=t||{};var p=[];if(t.in)p.push(fmtTok(t.in)+' in');if(t.out)p.push(fmtTok(t.out)+' out');if(t.cache)p.push(fmtTok(t.cache)+' cache');return p.join(' · ')||'—'}
+function fmtTokBreak(t,title){t=t||{};if(!(t.in||t.out||t.cache))return '';return ' · <span class=eng title="'+(title||'')+'">'+fmtTokParts(t)+'</span>'}
+function loginCmd(eng,n){return 'crotate login '+n+(eng==='codex'?' --engine codex':'')}
+function usline(lbl,p,resets,cls,extra){
+  if(p==null)return '';
+  var pc=Math.round(p),reset='',now=nowS();
+  if(resets&&resets>now)reset=' <span class=muted>resets '+resetLabel(resets)+'</span>';
+  return '<div class=usline><span class=uslbl>'+lbl+'</span><span class="bar '+cls+'"><i class="'+barCls(pc)+'" style="width:'+Math.min(100,pc)+'%"></i></span><span>'+pc+'%'+reset+(extra||'')+'</span></div>';
+}
+function usage(a,eng){
+  if(a.expired)return '<span class=muted title="this account&#39;s access token expired (Claude tokens are short-lived). Re-login to refresh it.">token expired — re-login: '+loginCmd(eng,a.acct_no)+'</span>';
+  var st=a.stale?' <span class=muted title="last known reading — live fetch briefly unavailable">·last known</span>':'';
+  var h=usline('5H',a.five_hour_pct,a.five_hour_resets_at,'',st)+usline('7D',a.seven_day_pct,a.seven_day_resets_at,'sm');
+  return h||'<span class=muted title="no per-account reading is available right now — shown as unknown rather than a number from another account">usage unknown</span>';
+}
+function acctRow(eng,a,now){
+  var cls=a.logged_in?(a.paused?'paused':(a.cooldown_until>now?'cool':'on')):'off';
+  var chips='';
+  if(a.logged_in){
+    if(a.mains)chips+='<span class="chip live" title="live sessions on this profile right now (any Claude Code / Codex window, wherever it was launched)">'+a.mains+' live</span> ';
+    else if(a.active)chips+='<span class="chip live" title="a session used this profile in the last 5 minutes">recently active</span> ';
+    if(a.subagents)chips+='<span class="chip agents" title="sub-agents (Agent-tool fleets + workflows) writing on this account now">'+a.subagents+' sub-agent'+(a.subagents===1?'':'s')+'</span> ';
+    if(a.armed)chips+='<span class="chip agents" title="hands-off auto-rotation is armed on this account — the session swaps itself to a fresh account at the threshold">armed@'+Math.round(a.armed_threshold||97)+'%</span> ';
+    if(a.cooldown_until>now)chips+='<span class="chip cool">cooldown '+fmtAge(a.cooldown_until-now)+' → '+clockTime(a.cooldown_until)+'</span> ';
+    if(a.paused)chips='<span class="chip paused" title="PAUSED — excluded from rotation until you unpause it: crotate unpause '+a.acct_no+(eng==='codex'?' --engine codex':'')+'">⏸ PAUSED — excluded</span> '+chips;
+  }
+  var who='<div class=who><div class=nm title="'+esc(a.profile||'')+'">acct '+esc(String(a.acct_no==null?'?':a.acct_no))+' — '+esc(a.name||'')+'</div><div class=em title="'+esc(a.email||'')+'">'+(a.email?esc(a.email):'<span class=muted>—</span>')+'</div></div>';
+  var right;
+  if(a.logged_in){right='<div class=use>'+usage(a,eng)+(chips?'<div style="margin-top:6px">'+chips+'</div>':'')+'</div>';}
+  else{right='<div class=use><span class=muted>not signed in — '+loginCmd(eng,a.acct_no)+'</span></div>';}
+  return '<div class="acct'+(a.paused?' paused':'')+'"><span class="dot '+cls+'"></span>'+who+right+'</div>';
+}
+function render(){
+  if(!DATA)return;var s=DATA,now=nowS();
+  document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+  var all=[];['claude','codex'].forEach(function(eng){(((s.engines||{})[eng])||[]).forEach(function(a){all.push(a)})});
+  var up=all.filter(function(a){return a.logged_in}).length;
+  var sess=s.sessions||[];
+  var nAg=sess.reduce(function(t,x){return t+(x.agents||[]).filter(function(a){return a.working}).length},0);
+  var armed=all.filter(function(a){return a.armed}).length;
+  var cooling=all.filter(function(a){return a.cooldown_until>now}).length;
+  var paused=all.filter(function(a){return a.paused}).length;
+  var rots=s.rotations||[];
+  var rot24=rots.filter(function(r){return (r.ts||0)>now-86400}).length;
+  document.getElementById('stats').innerHTML=
+    tile(up+'<span style="font-size:13px;color:var(--dim2)">/'+all.length+'</span>','accounts up','')+
+    tile(sess.length,'live sessions',(sess.length?'accent':''))+
+    tile(nAg,'sub-agents working',(nAg?'accent':''))+
+    tile(armed,'armed to rotate',(armed?'accent':''))+
+    tile(cooling,'cooling down',(cooling?'warn':''))+
+    tile(rot24+(paused?'<span style="font-size:13px;color:var(--dim2)"> · '+paused+' paused</span>':''),'rotations 24h','');
+  var working=sess.filter(function(x){return x.working||(x.agents||[]).some(function(a){return a.working})}).length;
+  var rcParts=[];
+  if(sess.length)rcParts.push(sess.length+' live session'+(sess.length>1?'s':''));
+  if(working)rcParts.push(working+' working');
+  if(nAg)rcParts.push(nAg+' sub-agent'+(nAg>1?'s':'')+' working');
+  document.getElementById('runningCount').textContent=rcParts.join(' · ')||'idle';
+  document.getElementById('active').innerHTML=sess.length?
+    '<div class=modesec style="margin-top:2px">Interactive sessions <span class=muted style="font-weight:400">(every live Claude Code + Codex window on this machine — any profile, any launcher — with their Agent fleets / workflows)</span></div>'+
+    sess.map(function(x){
+      var where=(x.cwd||'').split('/').slice(-2).join('/');
+      var ags=x.agents||[];
+      var nWork=ags.filter(function(a){return a.working}).length,nDone=ags.length-nWork;
+      var subBreak=ags.length?' <span class=muted style="font-weight:400">('+(nWork?nWork+' working':'')+(nWork&&nDone?', ':'')+(nDone?nDone+' done':'')+')</span>':'';
+      var subs=ags.length?' · <b>'+ags.length+' sub-agent'+(ags.length>1?'s':'')+'</b>'+subBreak:'';
+      var age=(x.age_s!=null)?' · <span class=muted>active '+(x.age_s<5?'now':x.age_s+'s ago')+'</span>':'';
+      var roll={in:0,out:0,cache:0};ags.forEach(function(a){var t=a.tok||{};roll.in+=t.in||0;roll.out+=t.out||0;roll.cache+=t.cache||0});
+      var subTokChip=(roll.in||roll.out||roll.cache)?' · <span class=eng title="across this session&#39;s sub-agents — input / output / cache">+'+fmtTokParts(roll)+' sub-agent</span>':'';
+      var state=x.working?'<span class=spin></span> working':'<span class=muted>idle</span>';
+      return '<div style="border:1px solid var(--line);padding:10px 12px;margin-bottom:8px">'+
+        '<b>'+esc(x.engine)+' acct '+esc(String(x.acct_no==null?'?':x.acct_no))+'</b> · session '+esc(String(x.session||'').slice(0,8))+
+        (where?' · <span class=muted>'+esc(where)+'</span>':'')+
+        (x.branch?' · <code style="font-size:11px">'+esc(x.branch)+'</code>':'')+
+        ' · '+state+subs+subTokChip+age+
+        (x.label?'<div class=muted style="margin:4px 0 0 2px;font-size:12px">→ '+esc(x.label)+'</div>':'')+
+        ags.map(function(a){
+          var wftag=a.wf?'<code style="font-size:10px" title="spawned by a Workflow run">'+esc(String(a.wf).slice(0,11))+'</code> ':'';
+          var atok=fmtTokBreak(a.tok,'this sub-agent — input / output / cache');
+          var badge=a.working?'<span class=eng title="writing now">▸ working</span> ':'<span class=muted title="finished its turn — workflow still in progress">✓ done</span> ';
+          var ageTag=(a.age_s!=null&&!a.working)?' <span class=muted style="font-size:11px">'+(a.age_s<60?a.age_s+'s':Math.round(a.age_s/60)+'m')+' ago</span>':'';
+          return '<div class=muted style="margin:4px 0 0 12px;font-size:12px">'+badge+wftag+esc(a.label||'(agent)')+atok+ageTag+'</div>'}).join('')+
+        '</div>';
+    }).join(''):
+    '<div class=muted>no live sessions right now — any open Claude Code or Codex window (on any account, however launched) appears here while it works</div>';
+  var ar=rots.filter(function(r){return (r.ts||0)>now-6*3600});
+  var arEl=document.getElementById('authrot');
+  if(ar.length){arEl.style.display='block';
+    arEl.innerHTML='AUTH ROTATIONS (last 6h) — '+ar.slice().reverse().map(function(x){
+      var t=new Date((x.ts||0)*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      return t+': '+esc(x.from_email||x.dest||'')+' → '+esc(x.to_email||x.src||'')+(x.reason&&x.reason!=='manual'?' ('+esc(x.reason)+')':'');
+    }).join(' · ');}
+  else arEl.style.display='none';
+  ['claude','codex'].forEach(function(eng){
+    var accts=((s.engines||{})[eng])||[];
+    var hint=document.getElementById(eng+'Hint');
+    if(hint)hint.textContent=(eng==='claude'?'Fable 5':'gpt-5.6')+' · '+accts.filter(function(a){return a.logged_in}).length+'/'+accts.length+' up';
+    document.getElementById(eng+'Accts').innerHTML=
+      accts.map(function(a){return acctRow(eng,a,now)}).join('')||
+      '<div class=muted>no profiles — '+loginCmd(eng,1)+'</div>';
+  });
+  document.getElementById('rotCount').textContent=rots.length?(rots.length+' recorded · newest first'):'';
+  document.getElementById('rotations').innerHTML=rots.length?
+    '<table><tr><th>when</th><th>engine</th><th>from</th><th>to</th><th>reason</th></tr>'+
+    rots.slice().reverse().map(function(r){
+      var d=new Date((r.ts||0)*1000);
+      return '<tr><td class=eng>'+d.toLocaleString()+'</td><td class=eng>'+esc(r.engine||'')+'</td><td>'+esc(r.from_email||r.dest||'')+'</td><td>'+esc(r.to_email||r.src||'')+'</td><td class=muted>'+esc(r.reason||'')+'</td></tr>';
+    }).join('')+'</table>':'<div class=muted>none yet</div>';
+}
+function load(){fetch('/status.json').then(function(r){return r.json()}).then(function(j){DATA=j;render()}).catch(function(){})}
+function applyTheme(mode){
+  if(mode==='light')document.documentElement.setAttribute('data-theme','light');
+  else document.documentElement.removeAttribute('data-theme');
+  var b=document.getElementById('themeBtn');if(b)b.textContent=(mode==='light'?'◑ Dark':'◐ Light');
+}
+function toggleTheme(){
+  var next=document.documentElement.getAttribute('data-theme')==='light'?'dark':'light';
+  try{localStorage.setItem('crotateTheme',next)}catch(e){}
+  applyTheme(next);
+}
+(function(){var t='dark';try{t=localStorage.getItem('crotateTheme')||'dark'}catch(e){}applyTheme(t)})();
+document.getElementById('themeBtn').addEventListener('click',toggleTheme);
+load();setInterval(load,10000);setInterval(render,1000);
+</script></div></body></html>
+"""
+
+
+def cmd_portal(argv):
+    """crotate portal [--port 8787] [--no-open] — read-only localhost dashboard."""
+    import http.server
+    port = 8787
+    if "--port" in argv:
+        try:
+            port = int(argv[argv.index("--port") + 1])
+        except (ValueError, IndexError):
+            pass
+    auto_open = "--no-open" not in argv and not os.environ.get("CROTATE_NO_OPEN")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] == "/status.json":
+                try:
+                    body = json.dumps(gather_status()).encode()
+                except Exception as e:
+                    body = json.dumps({"error": str(e)}).encode()
+                ct = "application/json"
+            else:
+                body = PORTAL_HTML.encode()
+                ct = "text/html; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    url = "http://127.0.0.1:%d" % port
+    print("crotate portal → %s  (read-only; Ctrl-C to stop)" % url)
+    if auto_open:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass  # headless / no browser — the URL is printed either way
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------- main ----------
+
+def usage():
+    print(__doc__.split("Commands:", 1)[0].rstrip())
+    print("Commands:" + __doc__.split("Commands:", 1)[1])
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("session-rotate", "session_rotate", "rotate"):
+        cmd_session_rotate(rest)
+    elif cmd == "disarm":
+        cmd_disarm(rest)
+    elif cmd == "usage-hook":
+        cmd_usage_hook(rest)
+    elif cmd in ("tick", "rotate-tick"):
+        cmd_tick(rest)
+    elif cmd == "rotate-auth":
+        cmd_rotate_auth(rest)
+    elif cmd == "login":
+        cmd_login(rest)
+    elif cmd == "run":
+        cmd_run(rest)
+    elif cmd == "status":
+        cmd_status(rest)
+    elif cmd == "log":
+        cmd_rotate_auth(["--log"])
+    elif cmd == "pause":
+        cmd_pause(rest, True)
+    elif cmd == "unpause":
+        cmd_pause(rest, False)
+    elif cmd == "portal":
+        cmd_portal(rest)
+    else:
+        err("crotate: unknown command %r (crotate --help)" % cmd)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

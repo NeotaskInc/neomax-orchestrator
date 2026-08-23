@@ -1,0 +1,223 @@
+#!/bin/zsh
+# ocx — OpenCode multi-account helper (OX Alpha Free by default).
+#
+# Account 1 uses OpenCode's normal XDG data location. Account N uses an isolated
+# XDG_DATA_HOME at ~/.opencode-acctN, so each profile gets its own Go auth.json,
+# SQLite session database, logs, and provider state. A runtime policy pins the chosen
+# model across OpenCode's built-in agents and disables sharing.
+#
+# Usage:
+#   ocx login N [provider] authenticate a provider for account N
+#   ocx N                shorthand for `ocx login N`
+#   ocx run [N] [--model provider/model] [args]
+#   ocx models [N] [provider] list that profile's local OpenCode model registry
+#   ocx status           auth/live/cooldown status for every OpenCode profile
+#   ocx whoami [N]       list authenticated providers for one profile
+#   ocx orch             authenticate the dedicated ~/.opencode-orch profile
+set -u
+
+OPEN_CODE_BIN="${NEOMAX_OPENCODE_BIN:-opencode}"
+OX_MODEL="opencode-go/ox-alpha-free"
+OPENCODE_MODEL="${NEOMAX_OPENCODE_MODEL:-$OX_MODEL}"
+SELF_DIR="${0:A:h}"
+OX_CONFIG="$SELF_DIR/../opencode/model-policy.json"
+STATE_COOLDOWN="$HOME/.neomax/cooldown.json"
+DEFAULT_PROFILE="$HOME/.opencode"
+
+acct_num() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then print 1
+  elif [[ "$1" == *-orch ]]; then print orch
+  else print "${1##*-acct}"
+  fi
+}
+profile_for() {
+  if (( $1 == 1 )); then print "$DEFAULT_PROFILE"; else print "$HOME/.opencode-acct$1"; fi
+}
+auth_path() {
+  if [[ "$1" == "$DEFAULT_PROFILE" ]]; then
+    print "$HOME/.local/share/opencode/auth.json"
+  else
+    print "$1/opencode/auth.json"
+  fi
+}
+logged_in() {
+  python3 - "$(auth_path "$1")" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    raise SystemExit(0 if any(isinstance(v, dict) and v.get("key") for v in data.values()) else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+set_profile_env() {
+  local prof="$1"
+  if [[ "$prof" == "$DEFAULT_PROFILE" ]]; then
+    unset XDG_DATA_HOME
+  else
+    mkdir -p "$prof"
+    export XDG_DATA_HOME="$prof"
+  fi
+}
+apply_model_policy() {
+  if [[ ! -r "$OX_CONFIG" ]]; then
+    print "ocx: OpenCode policy template missing: $OX_CONFIG" >&2
+    return 1
+  fi
+  local content
+  content="$(python3 - "$OX_CONFIG" "$OX_MODEL" "$1" <<'PY'
+import json, sys
+path, default_model, model = sys.argv[1:]
+try:
+    with open(path) as f:
+        data = json.load(f)
+    agents = data.get("agent") or {}
+    required = {"build", "plan", "general", "explore", "scout",
+                "compaction", "title", "summary"}
+    ok = (data.get("model") == default_model and data.get("small_model") == default_model
+          and data.get("enabled_providers") == ["opencode-go"]
+          and data.get("share") == "disabled" and set(agents) == required
+          and all((cfg or {}).get("model") == default_model for cfg in agents.values()))
+    if not ok:
+        raise ValueError("base policy template is invalid")
+    provider, sep, model_id = model.partition("/")
+    if not sep or not provider or not model_id:
+        raise ValueError("model must use provider/model form")
+    data["model"] = data["small_model"] = model
+    data["enabled_providers"] = [provider]
+    for cfg in agents.values(): cfg["model"] = model
+    print(json.dumps(data, separators=(",", ":")))
+except Exception as exc:
+    print("ocx: refusing OpenCode launch — invalid model policy: %s" % exc,
+          file=sys.stderr)
+    raise SystemExit(2)
+PY
+  )" || return $?
+  export OPENCODE_CONFIG_CONTENT="$content"
+  export OPENCODE_DISABLE_AUTOUPDATE=1
+  export OPENCODE_DISABLE_SHARE=1
+  export OPENCODE_AUTO_SHARE=false
+}
+count_live() {
+  python3 - "$1" <<'PY' 2>/dev/null || print 0
+import glob, json, os, sys
+profile = sys.argv[1]
+n = 0
+for path in glob.glob(os.path.expanduser("~/.neomax/runs/*.json")):
+    try:
+        rec = json.load(open(path))
+        if rec.get("engine") != "opencode" or rec.get("profile") != profile:
+            continue
+        if rec.get("status") != "running":
+            continue
+        os.kill(int(rec.get("worker_pid")), 0)
+        n += 1
+    except Exception:
+        pass
+print(n)
+PY
+}
+
+if [[ "${1:-}" == <1-> ]]; then set -- login "$1"; fi
+if [[ "${1:-}" == "orch" || "${1:-}" == "orchestrator" ]]; then set -- login orch "${@:2}"; fi
+cmd="${1:-status}"
+
+if [[ "$cmd" == "help" || "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+  print -r -- 'usage: ocx login N|orch [PROVIDER]
+       ocx N
+       ocx run [N] [--model PROVIDER/MODEL] [OPEN_CODE_ARGS...]
+       ocx models [N] [PROVIDER]
+       ocx status
+       ocx whoami [N|orch]
+
+The default is opencode-go/ox-alpha-free. `ocx models` lists qualified local IDs.'
+  exit 0
+fi
+
+if [[ "$cmd" == "run" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then local n="$2"; shift 2; else local n=1; shift; fi
+  local model="$OPENCODE_MODEL"; local runargs=()
+  while (( $# )); do
+    case "$1" in
+      --model|--opencode-model) model="$2"; shift 2;;
+      --model=*|--opencode-model=*) model="${1#*=}"; shift;;
+      *) runargs+=("$1"); shift;;
+    esac
+  done
+  set -- "${runargs[@]}"
+  local prof="$(profile_for "$n")"
+  if ! logged_in "$prof"; then
+    print "ocx: OpenCode account $n is not logged in — run: ocx login $n"; exit 1
+  fi
+  set_profile_env "$prof"
+  apply_model_policy "$model" || exit 1
+  print "ocx → OpenCode account $n ($prof) · $model"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: opencode $PWD --model $model --agent build --auto $*"; exit 0
+  fi
+  exec "$OPEN_CODE_BIN" "$PWD" --model "$model" --agent build --auto "$@"
+fi
+
+if [[ "$cmd" == "models" ]]; then
+  if [[ "${2:-}" == <1-> ]]; then local n="$2"; shift 2; else local n=1; shift; fi
+  local prof="$(profile_for "$n")"
+  set_profile_env "$prof"
+  exec "$OPEN_CODE_BIN" models "$@"
+fi
+
+if [[ "$cmd" == "login" ]]; then
+  local n="${2:-}"
+  if [[ "$n" == "orch" ]]; then
+    local prof="$HOME/.opencode-orch"
+  elif [[ -z "$n" || "$n" != <1-> ]]; then
+    print "usage: ocx login N|orch"; exit 2
+  else
+    local prof="$(profile_for "$n")"
+  fi
+  set_profile_env "$prof"
+  local provider="${3:-opencode-go}"; local loginargs=()
+  if [[ "$provider" == -* ]]; then provider="opencode-go"; loginargs=("${@:3}"); else loginargs=("${@:4}"); fi
+  print "ocx → logging in OpenCode provider $provider for account $n"
+  print "      profile data: $([[ "$prof" == "$DEFAULT_PROFILE" ]] && print "$HOME/.local/share/opencode" || print "$prof/opencode")"
+  "$OPEN_CODE_BIN" auth login --provider "$provider" "${loginargs[@]}"
+  if logged_in "$prof"; then
+    print "ocx: account $n logged in ✓"
+  else
+    print "ocx: login did not complete"
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ "$cmd" == "whoami" ]]; then
+  local n="${2:-1}" prof
+  if [[ "$n" == "orch" ]]; then prof="$HOME/.opencode-orch"
+  elif [[ "$n" == <1-> ]]; then prof="$(profile_for "$n")"
+  else print "usage: ocx whoami N|orch"; exit 2
+  fi
+  set_profile_env "$prof"
+  exec "$OPEN_CODE_BIN" auth list
+fi
+
+if [[ "$cmd" != "status" ]]; then
+  print "usage: ocx login N|orch [provider] | run [N] [--model provider/model] [args] | models [N] [provider] | status | whoami [N|orch]"; exit 2
+fi
+
+local now=$(date +%s) hi=1 d num
+for d in $HOME/.opencode-acct<2->(Nn/); do (( ${d##*-acct} > hi )) && hi="${d##*-acct}"; done
+for (( num=1; num<=hi; num++ )); do
+  local prof="$(profile_for "$num")"
+  local live="$(count_live "$prof")"
+  local auth="NOT LOGGED IN — run: ocx login $num"
+  logged_in "$prof" && auth="provider connected"
+  local cool=$(python3 - "$STATE_COOLDOWN" "$prof" <<'PY' 2>/dev/null
+import json, sys
+with open(sys.argv[1]) as f:
+    print(int(json.load(f).get(sys.argv[2], 0)))
+PY
+  )
+  if [[ -n "$cool" && "$cool" != "null" && "$cool" -gt "$now" ]]; then
+    auth="$auth, rate-limit cooldown $(( (cool - now) / 60 ))m left"
+  fi
+  print "opencode account $num  $prof  —  $live live worker(s), $auth · default $OPENCODE_MODEL"
+done

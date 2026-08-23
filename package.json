@@ -1,0 +1,37 @@
+{
+  "name": "neomax-orchestrator",
+  "version": "1.0.0",
+  "description": "Multi-account Claude, Codex, OpenCode, Kimi, and Grok orchestrator with isolated, resumable, self-healing workers integrated through git worktrees and PRs.",
+  "homepage": "https://github.com/NeotaskInc/neomax-orchestrator#readme",
+  "bugs": {
+    "url": "https://github.com/NeotaskInc/neomax-orchestrator/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NeotaskInc/neomax-orchestrator.git"
+  },
+  "scripts": {
+    "start": "bash install.sh",
+    "install-neomax": "bash install.sh",
+    "uninstall": "bash uninstall.sh",
+    "install-rotate": "bash standalone-rotate/install.sh",
+    "uninstall-rotate": "bash standalone-rotate/uninstall.sh",
+    "test": "python3 tests/test_neomax.py && python3 standalone-rotate/test_crotate.py"
+  },
+  "bin": {
+    "neomax": "bin/neomax",
+    "cmax": "bin/cmax",
+    "cdx": "bin/cdx",
+    "cdxmax": "bin/cdxmax",
+    "ocx": "bin/ocx",
+    "ocmax": "bin/ocmax",
+    "kmx": "bin/kmx",
+    "kmax": "bin/kmax",
+    "gmx": "bin/gmx",
+    "gmax": "bin/gmax",
+    "neomax-portal": "bin/neomax-portal",
+    "neomax-usage-agent": "bin/neomax-usage-agent",
+    "neomax-worktrees": "project/neomax-worktrees"
+  },
+  "license": "MIT"
+}

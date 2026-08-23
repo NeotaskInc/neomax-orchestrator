@@ -1,0 +1,124 @@
+#!/bin/zsh
+set -u
+
+SELF_DIR="${0:A:h}"
+NEOMAX_CORE="${NEOMAX_CORE:-$SELF_DIR/../lib/neomax_core.py}"
+[[ -f "$NEOMAX_CORE" ]] || { print "neomax: implementation library not found" >&2; exit 1; }
+
+launcher_for() {
+  case "$1" in
+    claude) print "$SELF_DIR/cmax";;
+    codex) print "$SELF_DIR/cdxmax";;
+    opencode) print "$SELF_DIR/ocmax";;
+    kimi) print "$SELF_DIR/kmax";;
+    grok) print "$SELF_DIR/gmax";;
+  esac
+}
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- 'usage: neomax [--engine ENGINE] [--prefer ENGINE,...] [--workers SCOPE] [MODEL_FLAGS...] [INITIAL_TASK...]
+       neomax launch resume [SESSION_ID] [--engine ENGINE]
+       neomax delegate [WORKER_OPTIONS...] auto|ACCOUNT "PROMPT"
+       neomax select [--json] [--engine ENGINE] [--prefer ENGINE,...]
+       neomax status
+       neomax portal [PORT]
+
+Neomax selects an eligible connected orchestrator dynamically and enables every
+viable worker provider. --engine pins the orchestrator. --prefer sets the final
+tie-break order; NEOMAX_ENGINE_PRIORITY provides the persistent equivalent.
+The provider-specific cmax/cdxmax/ocmax/kmax/gmax commands remain available.'
+  print
+  exec python3 "$NEOMAX_CORE" help
+fi
+
+if [[ "${1:-}" == "delegate" ]]; then
+  shift; exec python3 "$NEOMAX_CORE" "$@"
+fi
+case "${1:-}" in
+  ls|log|resume|retry|kill|pr|reconcile|ack|audit|find|history|status|pause|unpause|paused|orchestrators|orch-list|orchs|orch-register|orch_register|orch-unregister|orch_unregister|premerge-check|premerge|pick-orch|pick_orch|pick-neomax|pick_neomax|orch-on|orch_on|solo-rotate|solo_rotate|solo-setup|solo_setup|session-rotate|session_rotate|rotate|rotate-tick|rotate_tick|handoff|modes|sessions|subagents|diff|subagent-diff|subagent_diff|projects|project-register|project_register|register-project|project-unregister|project_unregister|unregister-project|task|tasks|backlog|rotate-auth|rotate_auth|orient|usage|usage-watch|usage_watch|keepalive|keep-alive|turn-hook|turn_hook|model-guard|model_guard|usage-hook|usage_hook|run-all|runall|shepherd|issue|ci-sync|queue|clean|tidy|auto)
+    exec python3 "$NEOMAX_CORE" "$@";;
+esac
+
+if [[ "${1:-}" == "portal" ]]; then
+  shift
+  portal="${NEOMAX_PORTAL_BIN:-$SELF_DIR/neomax-portal}"
+  [[ -x "$portal" ]] || portal="neomax-portal"
+  exec "$portal" "$@"
+fi
+
+mode="launch"
+if [[ "${1:-}" == "launch" ]]; then
+  shift
+  if [[ "${1:-}" == "resume" ]]; then mode="resume"; shift; fi
+elif [[ "${1:-}" == "session" && "${2:-}" == "resume" ]]; then
+  mode="resume"; shift 2
+elif [[ "${1:-}" == "select" || "${1:-}" == "why" ]]; then mode="select"; shift
+fi
+
+engine=""
+priority="${NEOMAX_ENGINE_PRIORITY:-}"
+workers=""
+json_output=0
+dedicated=0
+forward=()
+while (( $# )); do
+  case "$1" in
+    --engine) [[ $# -ge 2 ]] || { print "neomax: --engine requires a value" >&2; exit 2; }; engine="$2"; shift 2;;
+    --engine=*) engine="${1#*=}"; shift;;
+    --prefer|--priority) [[ $# -ge 2 ]] || { print "neomax: $1 requires a value" >&2; exit 2; }; priority="$2"; shift 2;;
+    --prefer=*|--priority=*) priority="${1#*=}"; shift;;
+    --workers) [[ $# -ge 2 ]] || { print "neomax: --workers requires a value" >&2; exit 2; }; workers="$2"; shift 2;;
+    --workers=*) workers="${1#*=}"; shift;;
+    --orchestrator) dedicated=1; forward+=("$1"); shift;;
+    --json) json_output=1; shift;;
+    *) forward+=("$1"); shift;;
+  esac
+done
+
+pick_args=(pick-neomax --json --cwd "$PWD")
+[[ -n "$engine" ]] && pick_args+=(--engine "$engine")
+[[ -n "$priority" ]] && pick_args+=(--priority "$priority")
+[[ "$mode" == "resume" ]] && pick_args+=(--resume)
+(( dedicated )) && pick_args+=(--dedicated)
+[[ "$mode" != "select" ]] && pick_args+=(--record)
+choice="$(python3 "$NEOMAX_CORE" "${pick_args[@]}")" || exit $?
+
+if [[ "$mode" == "select" && $json_output -eq 1 ]]; then
+  print -r -- "$choice"
+  exit 0
+fi
+
+selection="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("\t".join((d["engine"], ",".join(d["engines"]), d["reason"])))' "$choice")" || exit 1
+IFS=$'\t' read -r selected viable reason <<< "$selection"
+[[ -n "$viable" ]] || { print "neomax: no connected provider is eligible for workers" >&2; exit 1; }
+
+scope="$viable"
+if [[ -n "$workers" ]]; then
+  resolved="$(python3 -c 'import re,sys
+available=[x for x in sys.argv[1].split(",") if x]
+raw=sys.argv[2]
+requested=available if raw=="all" else [x for x in re.split(r"[,+]",raw) if x]
+valid={"claude","codex","opencode","kimi","grok"}
+bad=[x for x in requested if x not in valid]
+if bad: raise SystemExit("invalid:"+",".join(bad))
+chosen=[x for x in available if x in requested]
+missing=[x for x in requested if x not in available]
+print(",".join(chosen)+"\t"+",".join(missing))' "$viable" "$workers")" || {
+    print "neomax: --workers must be all or a comma/plus list of claude,codex,opencode,kimi,grok" >&2
+    exit 2
+  }
+  IFS=$'\t' read -r scope unavailable <<< "$resolved"
+  [[ -n "$scope" ]] || { print "neomax: none of the requested worker providers are connected and eligible" >&2; exit 1; }
+  [[ -n "${unavailable:-}" ]] && print "neomax: unavailable worker providers omitted: $unavailable" >&2
+fi
+
+print "neomax → $selected orchestrator · workers=$scope"
+print "neomax → $reason"
+[[ "$mode" == "select" ]] && exit 0
+
+launcher="$(launcher_for "$selected")"
+[[ -x "$launcher" ]] || launcher="${launcher:t}"
+if [[ "$mode" == "resume" ]]; then
+  exec "$launcher" --workers "$scope" resume "${forward[@]}"
+fi
+exec "$launcher" --workers "$scope" "${forward[@]}"

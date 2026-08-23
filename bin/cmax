@@ -1,0 +1,419 @@
+#!/bin/zsh
+# cmax — multi-account Claude Code launcher.
+# Multiple Max accounts, one machine: each profile dir is a separate login
+# (CLAUDE_CONFIG_DIR namespaces the Keychain entry per dir, claude >= 2.1.56).
+#
+# Usage:
+#   cmax            launch on the account with the fewest live Claude Code sessions
+#   cmax 1|2|3      force a specific account
+#   cmax --workers claude|codex|opencode|kimi|grok|all (or a comma/plus-separated subset)
+#                                     fleet SCOPE: which engines this Claude orchestrator
+#                                     may farm work to (default all). Modes:
+#                                       cmax                  → Claude orch, all accounts
+#                                       cmax --workers claude → Claude orch, Claude-only
+#                                       cmax --workers codex  → Claude orch, Codex workers
+#                                       cmax --workers opencode → Claude orch, OpenCode workers
+#                                       cmax --workers kimi   → Claude orch, Kimi workers
+#   cmax status     show live-session counts and login state per account
+#   cmax <n> /login first-time sign-in for account n (any claude args pass through)
+#   cmax resume [<session-id>] [--workers ...]
+#                   resume a quit orchestrator session WITH the latest cmax code/hooks:
+#                   auto-finds the account that owns the session and execs
+#                   `claude --resume <id>` under it. No id = most recent session anywhere.
+#   cmax orchestrator [args]   authenticate/use the DEDICATED orchestrator account
+#                   (~/.claude-orch — a separate account reserved for orchestration).
+#                   First time: `cmax orchestrator` then /login.
+#   cmax --orchestrator [--workers ...]   launch the orchestrator ON the reserved
+#                   account, EXCLUDED from the worker pool (neomax enforces it) —
+#                   orchestration always has quota; all other accounts do the tasks.
+#                   Without the flag the orch account just joins the normal pool.
+set -u
+
+# Account profiles: acct 1 = ~/.claude (default login), acct N = ~/.claude-acctN.
+# Discovered DYNAMICALLY (glob, numeric sort) so a newly-added account appears
+# everywhere with no code edits — the same discovery neomax uses for delegation.
+# Qualifiers: (N)=nullglob (no match → nothing), (n)=numeric sort, (/)=dirs only.
+PROFILES=("$HOME/.claude" $HOME/.claude-acct<2->(Nn/))
+
+# ---- Explicit default for the orchestrator / solo session; --model can override it. ----
+# Keep this default aligned with CLAUDE_DEFAULT_MODEL in bin/neomax.
+CLAUDE_MODEL="${NEOMAX_CLAUDE_MODEL:-claude-fable-5[1m]}"
+CODEX_WORKER_MODEL="${NEOMAX_CODEX_MODEL:-gpt-5.6-sol}"
+OPENCODE_WORKER_MODEL="${NEOMAX_OPENCODE_MODEL:-opencode-go/ox-alpha-free}"
+KIMI_WORKER_MODEL="${NEOMAX_KIMI_MODEL:-kimi-code/k3}"
+GROK_WORKER_MODEL="${NEOMAX_GROK_MODEL:-grok-4.6}"
+
+# Account number from a profile path (~/.claude → 1, ~/.claude-acctN → N).
+acct_num() { if [[ "$1" == "$HOME/.claude" ]]; then print 1; elif [[ "$1" == *-orch ]]; then print orch; else print "${1##*-acct}"; fi }
+
+# Create acctN on demand, sharing account 1's config by symlink (mirrors install.sh)
+# so `cmax N` for a brand-new account Just Works — no re-install needed. The default
+# profile (~/.claude) always exists.
+ensure_claude_profile() {
+  local prof="$1" item n
+  [[ "$prof" == "$HOME/.claude" || -d "$prof" ]] && return 0
+  n="$(acct_num "$prof")"
+  print "cmax → first use of $n — creating $prof (sharing account 1's config)"
+  mkdir -p "$prof"
+  for item in CLAUDE.md settings.json commands plugins; do
+    [[ -e "$HOME/.claude/$item" ]] && ln -sfn "$HOME/.claude/$item" "$prof/$item"
+  done
+  # new account → its `claudeN` shell helper is generated dynamically (neomax-aliases.zsh) for every
+  # NEW shell; tell the user how to get it in THIS shell without opening a new terminal.
+  if [[ "$n" == <-> ]]; then
+    print "cmax → account $n linked. The \`claude$n\` shortcut is active in any NEW terminal — or run now:  source ~/.local/bin/neomax-aliases.zsh"
+  fi
+}
+
+# Count REAL running claude processes per profile (reads each process's
+# CLAUDE_CONFIG_DIR from its environment), so sessions launched any way —
+# plain `claude`, cmax, neomax workers — are all seen.
+count_live() {
+  local profile="$1" n=0 pid cfg
+  for pid in $(pgrep -U $UID -x claude 2>/dev/null); do
+    # Extract CLAUDE_CONFIG_DIR from the process env. `ps eww` space-joins the env, so a
+    # value can't be naively cut on spaces (a profile path with a space would be truncated).
+    # Capture up to the NEXT ` VAR=` env token or the command path — space-safe.
+    cfg=$(ps eww -o command= -p "$pid" 2>/dev/null | python3 -c 'import sys,re
+m=re.search(r"CLAUDE_CONFIG_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=| /\S|$)", sys.stdin.read())
+print(m.group(1) if m else "")' 2>/dev/null)
+    [[ "${cfg:-$HOME/.claude}" == "$profile" ]] && ((n++))
+  done
+  print $n
+}
+
+keychain_service() {
+  local p="$1"
+  if [[ "$p" == "$HOME/.claude" ]]; then
+    print "Claude Code-credentials"
+  else
+    print "Claude Code-credentials-$(printf '%s' "$p" | shasum -a 256 | cut -c1-8)"
+  fi
+}
+
+logged_in() {
+  local p="$1"
+  security find-generic-password -s "$(keychain_service "$p")" >/dev/null 2>&1 && return 0
+  [[ -f "$p/.credentials.json" ]] && return 0
+  return 1
+}
+
+# Identity ("email [plan]") of the account a profile is signed into, parsed from the
+# authoritative `claude auth status` JSON piped in on stdin. CLAUDE_CONFIG_DIR-aware
+# (the caller already runs the probe per profile), so it resolves the moment an
+# account logs in. Empty string if unknown.
+claude_identity() {
+  python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+em=d.get("email") or ""
+plan=d.get("subscriptionType") or ""
+print(em + (" ["+plan+"]" if plan and em else ""))' 2>/dev/null
+}
+
+launch_portal() {
+  local self_dir="${0:A:h}" portal="${NEOMAX_PORTAL_BIN:-}"
+  if [[ -z "$portal" && -x "$self_dir/neomax-portal" ]]; then portal="$self_dir/neomax-portal"
+  elif [[ -z "$portal" ]] && command -v neomax-portal >/dev/null 2>&1; then portal="neomax-portal"
+  fi
+  [[ -n "$portal" ]] || { print "cmax: neomax-portal not found" >&2; return 1; }
+  exec "$portal" "$@"
+}
+
+if [[ "${1:-}" == "portal" ]]; then
+  shift; launch_portal "$@"
+fi
+
+if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print -r -- 'usage: cmax [ACCOUNT] [--workers SCOPE] [--model MODEL] [INITIAL_TASK...]
+       cmax --orchestrator [--workers SCOPE] [--model MODEL]
+       cmax resume [SESSION_ID] [--model MODEL]
+       cmax solo [--model MODEL] [INITIAL_TASK...]
+       cmax status | portal [PORT]
+
+Claude defaults to claude-fable-5[1m]. Every --ENGINE-model MODEL flag sets that
+delegated worker pool; --claude-model is an alias for the orchestrator --model.'
+  exit 0
+fi
+
+# `cmax solo [prompt...]` — SOLO mode: a PLAIN Claude Code session (reads CLAUDE.md/AGENTS.md
+# normally, nothing injected), with just two defaults baked in: (1) ULTRACODE on by default
+# ($CLAUDE_MODEL — Fable 5 unless explicitly overridden — xhigh effort + Workflows + sub-agents), and
+# (2) automatic in-place auth-rotation via the per-turn Stop hook (NO background poller) — it swaps
+# to the freshest account when 5h or weekly usage hits 99%, no /login. It is NOT an orchestrator: no
+# neomax delegation, no opener directive,
+# no orchestrator registration — you drive it yourself, per session. Runs on the dedicated
+# ~/.claude-solo profile (creds rotated through the real accounts). At rotation, if the spent and
+# freshest native slots are both idle it SWAPS them (the two accounts trade places, no slot ends up
+# duplicating another); only when a slot is busy does it fall back to an isolated copy.
+if [[ "${1:-}" == "solo" ]]; then
+  shift
+  local soloargs=()
+  while (( $# )); do
+    case "$1" in
+      --model|--claude-model) CLAUDE_MODEL="$2"; shift 2;;
+      --model=*|--claude-model=*) CLAUDE_MODEL="${1#*=}"; shift;;
+      *) soloargs+=("$1"); shift;;
+    esac
+  done
+  set -- "${soloargs[@]}"
+  unset CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK
+  launchctl unsetenv CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK 2>/dev/null || true
+  local SOLO="$HOME/.claude-solo"
+  ensure_claude_profile "$SOLO"          # settings.json/CLAUDE.md/commands/plugins (NOT creds)
+  local startacct
+  startacct="$(command neomax solo-setup 2>&1)" || { print "cmax solo: $startacct"; exit 1; }
+  export CLAUDE_CONFIG_DIR="$SOLO"
+  # NEOMAX_MODE=solo is the ONLY cmax marker — it (1) silences the orchestrator opener so this is a
+  # plain session, and (2) tells the per-turn Stop hook to auto-rotate this session at 99% 5h / 99%
+  # weekly. NO background poller (no usage burned on an interval) — rotation rides the Stop hook that
+  # fires at every turn-end. Deliberately NO NEOMAX_ROLE/NEOMAX_FLEET/NEOMAX_ORCH_SESSION + no orch-register.
+  export NEOMAX_MODE="solo"
+  export NEOMAX_CLAUDE_MODEL="$CLAUDE_MODEL"
+  print "cmax solo → plain $CLAUDE_MODEL session on $startacct · effort xhigh + ultracode/workflows · auto-rotates auth at 99% 5h / 99% 7d each turn-end (no /login, no polling). No orchestrator prompts — you drive it."
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: claude --model $CLAUDE_MODEL --effort xhigh --settings '{\"ultracode\":true}' --dangerously-skip-permissions $*"; exit 0
+  fi
+  # --effort xhigh = the valid "extra high effort" level ('ultracode' is NOT a CLI --effort value);
+  # the ultracode setting is best-effort workflow-enable. The session is plain otherwise.
+  exec claude --model "$CLAUDE_MODEL" --effort xhigh --settings '{"ultracode":true}' --dangerously-skip-permissions "$@"
+fi
+
+if [[ "${1:-}" == "status" ]]; then
+  # Unified status is owned by neomax (and rendered by the portal). Prefer that
+  # single source so this view includes Claude, Codex, AND OpenCode. Keep the legacy
+  # shell probes below only as a fallback for a partial/broken installation.
+  local self_dir="${0:A:h}" neomax_bin=""
+  if [[ -x "$self_dir/neomax" ]]; then neomax_bin="$self_dir/neomax"
+  elif command -v neomax >/dev/null 2>&1; then neomax_bin="neomax"; fi
+  [[ -n "$neomax_bin" ]] && exec "$neomax_bin" status
+  print "CLAUDE accounts (orchestrator + worker pool):"
+  # Show the baseline fleet (3) PLUS any higher-numbered accounts that exist, so
+  # not-yet-created slots still appear as a "run: cmax N" prompt.
+  local now=$(date +%s) hi=3 d num
+  for d in $HOME/.claude-acct<2->(Nn/); do (( ${d##*-acct} > hi )) && hi="${d##*-acct}"; done
+  for (( num=1; num<=hi; num++ )); do
+    local p="$HOME/.claude-acct$num"; (( num == 1 )) && p="$HOME/.claude"
+    local n=$(count_live "$p")
+    local auth="NOT LOGGED IN — run: cmax $num"
+    # zero-token truth probe: exits 0 iff this profile's token is valid.
+    # Default profile must probe with CLAUDE_CONFIG_DIR UNSET (setting it,
+    # even to ~/.claude, switches to the hash-suffixed Keychain entry).
+    local probe_ok=1 probe_out=""
+    if [[ "$p" == "$HOME/.claude" ]]; then
+      probe_out=$(env -u CLAUDE_CONFIG_DIR claude auth status 2>/dev/null) && probe_ok=0
+    else
+      probe_out=$(CLAUDE_CONFIG_DIR="$p" command claude auth status 2>/dev/null) && probe_ok=0
+    fi
+    if (( probe_ok == 0 )); then
+      auth="logged in"
+      local em=$(print -r -- "$probe_out" | claude_identity)
+      [[ -n "$em" ]] && auth="logged in — $em"
+    elif logged_in "$p"; then
+      auth="credentials present but token INVALID — re-run /login via: cmax $num"
+    fi
+    local cool=$(python3 -c "import json,sys;print(int(json.load(open('$HOME/.neomax/cooldown.json')).get(sys.argv[1],0)))" "$p" 2>/dev/null)
+    if [[ -n "$cool" && "$cool" -gt "$now" ]]; then
+      auth="$auth, usage-limit cooldown $(( (cool - now) / 60 ))m left"
+    fi
+    print "  account $num  $p  —  $n live session(s), $auth"
+  done
+  # Unified view: also render the Codex worker pool via the sibling cdx helper
+  # (resolved relative to this script, so it works even if cdx isn't on PATH).
+  local self_dir="${0:A:h}" cdx_bin=""
+  if [[ -x "$self_dir/cdx" ]]; then cdx_bin="$self_dir/cdx"
+  elif command -v cdx >/dev/null 2>&1; then cdx_bin="cdx"; fi
+  print ""
+  print "CODEX accounts (worker pool):"
+  if [[ -n "$cdx_bin" ]]; then
+    "$cdx_bin" status 2>/dev/null | sed 's/^/  /'
+  else
+    print "  (cdx helper not found at $self_dir/cdx or on PATH)"
+  fi
+  exit 0
+fi
+
+# --workers all|ENGINE[,ENGINE...] : which engines this Claude orchestrator may farm to
+# (the fleet SCOPE / mode). Default all. Filtered out of the args before they reach
+# `claude`; exported as NEOMAX_FLEET (neomax's hard guard) + NEOMAX_ROLE=claude.
+local fleet="all" want_orch=0; local newargs=()
+while (( $# )); do
+  case "$1" in
+    --workers) fleet="${2:-all}"; shift 2;;
+    --workers=*) fleet="${1#--workers=}"; shift;;
+    --orchestrator) want_orch=1; shift;;
+    --model|--claude-model) CLAUDE_MODEL="$2"; shift 2;;
+    --model=*|--claude-model=*) CLAUDE_MODEL="${1#*=}"; shift;;
+    --codex-model) CODEX_WORKER_MODEL="$2"; shift 2;;
+    --codex-model=*) CODEX_WORKER_MODEL="${1#*=}"; shift;;
+    --opencode-model) OPENCODE_WORKER_MODEL="$2"; shift 2;;
+    --opencode-model=*) OPENCODE_WORKER_MODEL="${1#*=}"; shift;;
+    --kimi-model) KIMI_WORKER_MODEL="$2"; shift 2;;
+    --kimi-model=*) KIMI_WORKER_MODEL="${1#*=}"; shift;;
+    --grok-model) GROK_WORKER_MODEL="$2"; shift 2;;
+    --grok-model=*) GROK_WORKER_MODEL="${1#*=}"; shift;;
+    *) newargs+=("$1"); shift;;
+  esac
+done
+set -- "${newargs[@]}"
+python3 - "$fleet" <<'PY' || { print "cmax: --workers must be all or a comma/plus list of claude,codex,opencode,kimi,grok" >&2; exit 2; }
+import re, sys
+p = {x for x in re.split(r"[,+]", sys.argv[1]) if x}
+raise SystemExit(0 if sys.argv[1] == "all" or (p and p <= {"claude","codex","opencode","kimi","grok"}) else 1)
+PY
+# `cmax --workers X status|portal` puts the subcommand AFTER a flag, so the top-of-file
+# checks (which inspect a clean $1) miss it and it would fall through to a live launch.
+# Flags are stripped now — re-dispatch status/portal here.
+if [[ "${1:-}" == "portal" ]]; then shift; launch_portal "$@"; fi
+if [[ "${1:-}" == "status" ]]; then exec "$0" status "${@:2}"; fi
+export NEOMAX_FLEET="$fleet" NEOMAX_ROLE="claude" NEOMAX_PROJECT_ROOT="$PWD"
+export NEOMAX_CLAUDE_MODEL="$CLAUDE_MODEL" NEOMAX_CODEX_MODEL="$CODEX_WORKER_MODEL"
+export NEOMAX_OPENCODE_MODEL="$OPENCODE_WORKER_MODEL" NEOMAX_KIMI_MODEL="$KIMI_WORKER_MODEL"
+export NEOMAX_GROK_MODEL="$GROK_WORKER_MODEL"
+# CO-ORCHESTRATION: a unique id for THIS orchestrator session + its pid, so concurrent
+# all Neomax provider sessions can see each other, scope their own runs, and coordinate merges. $$ is
+# this launcher shell, which `exec claude` keeps as the orchestrator's pid (registered just
+# before each exec below via _register_orch).
+export NEOMAX_ORCH_SESSION="orch-claude-$$-$(date +%s)"
+export NEOMAX_ORCH_PID=$$
+_register_orch() { command neomax orch-register 2>/dev/null || true; }
+# REFUSAL-FALLBACK MUST STAY ENABLED: CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1 turns a model's
+# false-flag refusal into a HARD-ERROR that kills the turn instead of silently auto-switching and
+# continuing. We never want that. Scrub it from the GUI-wide launchctl env (where it once lodged
+# and got inherited by every claude launch) AND from this launch env, so no cmax session can ever
+# inherit it (it has bitten us repeatedly).
+launchctl unsetenv CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK 2>/dev/null || true
+unset CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK
+# MODEL PIN: every cmax orchestrator session launches with an EXPLICIT --model "$CLAUDE_MODEL".
+# Without it, claude inherits the user's saved default — which /login, account switches, and
+# compaction-continuations silently re-apply, and that default has drifted before. Pinning here
+# makes the selected default or explicit override stable for the whole session.
+
+ORCH_PROF="$HOME/.claude-orch"
+
+# `cmax orchestrator [claude args...]` — authenticate / open a session on the DEDICATED
+# orchestrator account (mirrors `cmax N`; creates the profile on first use). Run /login
+# inside it the first time. Once logged in, `cmax --orchestrator` runs reserved-mode.
+if [[ "${1:-}" == "orchestrator" || "${1:-}" == "orch" ]]; then
+  shift
+  ensure_claude_profile "$ORCH_PROF"
+  print "cmax → DEDICATED orchestrator account ($ORCH_PROF)"
+  logged_in "$ORCH_PROF" || print "     not logged in yet — run /login in this session to set it up"
+  export CLAUDE_CONFIG_DIR="$ORCH_PROF"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: claude --model $CLAUDE_MODEL --dangerously-skip-permissions $*"; exit 0; fi
+  _register_orch
+  exec claude --model "$CLAUDE_MODEL" --dangerously-skip-permissions "$@"
+fi
+
+# `cmax --orchestrator` — run THE orchestrator on the reserved account; neomax
+# excludes it from the worker pool (NEOMAX_ORCH_RESERVED=1).
+if (( want_orch )); then
+  if ! logged_in "$ORCH_PROF"; then
+    print "cmax: no dedicated orchestrator account — set one up first: cmax orchestrator  (then /login)"
+    exit 1
+  fi
+  export NEOMAX_ORCH_RESERVED=1 CLAUDE_CONFIG_DIR="$ORCH_PROF"
+  print "cmax → DEDICATED orchestrator ($ORCH_PROF, RESERVED — excluded from the worker pool) · workers=$fleet"
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: claude --model $CLAUDE_MODEL --dangerously-skip-permissions $*"; exit 0; fi
+  _register_orch
+  exec claude --model "$CLAUDE_MODEL" --dangerously-skip-permissions "$@"
+fi
+
+# `cmax resume [<session-id>]` (or `cmax --resume <id>`) — resume a quit orchestrator
+# session with the LATEST cmax code/hooks/env (resume = a fresh process restoring the
+# conversation; the SessionStart orient hook re-fires with the current mode). The
+# session id is the transcript filename under the OWNING profile's projects/ dir
+# (what `claude` prints on exit: "Resume this session with: claude --resume <id>") —
+# resuming under any other CLAUDE_CONFIG_DIR can't find it, so we auto-locate the
+# owner across every account profile. No id = the most recent session anywhere.
+if [[ "${1:-}" == "resume" || "${1:-}" == "--resume" ]]; then
+  shift
+  local rid=""
+  [[ -n "${1:-}" && "${1:-}" != -* ]] && { rid="$1"; shift }
+  local loc
+  loc=$(python3 - "$rid" <<'PY'
+import glob, os, sys
+ident = sys.argv[1]
+profs = ([os.path.expanduser("~/.claude")] + sorted(glob.glob(os.path.expanduser("~/.claude-acct*")))
+         + [d for d in [os.path.expanduser("~/.claude-orch")] if os.path.isdir(d)])
+best = None
+for p in profs:
+    for f in glob.glob(os.path.join(p, "projects", "*", "*.jsonl")):
+        sid = os.path.basename(f)[:-6]
+        if ident:
+            if sid == ident:
+                print(p + "\t" + sid); sys.exit(0)
+        else:
+            m = os.path.getmtime(f)
+            if best is None or m > best[0]:
+                best = (m, p, sid)
+if not ident and best:
+    print(best[1] + "\t" + best[2]); sys.exit(0)
+sys.exit(1)
+PY
+  ) || { print "cmax: session ${rid:-<most recent>} not found in any Claude account profile"; exit 1 }
+  local rprof="${loc%%	*}" rsid="${loc##*	}"
+  print "cmax → resuming session $rsid on account $(acct_num "$rprof") ($rprof) · workers=$fleet"
+  if [[ "$rprof" == "$HOME/.claude" ]]; then
+    unset CLAUDE_CONFIG_DIR
+  else
+    export CLAUDE_CONFIG_DIR="$rprof"
+  fi
+  if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then
+    print "DRY: claude --model $CLAUDE_MODEL --dangerously-skip-permissions --resume $rsid $*"; exit 0
+  fi
+  _register_orch
+  exec claude --model "$CLAUDE_MODEL" --dangerously-skip-permissions --resume "$rsid" "$@"
+fi
+
+local pick=""
+if [[ "${1:-}" == <1-> ]]; then
+  # explicit account number (any N) — compute its profile (acct 1 = default) and
+  # create it on first use, so a brand-new account works with no install step.
+  local n="$1"; shift
+  if (( n == 1 )); then pick="$HOME/.claude"; else pick="$HOME/.claude-acct$n"; fi
+  ensure_claude_profile "$pick"
+else
+  # USAGE-AWARE orchestrator pick (single source of truth = neomax): freshest logged-in
+  # account that is NOT paused and NOT weekly-exhausted (>=99%). The old picker only counted
+  # live sessions, so it would land the orchestrator on a 98%-weekly or PAUSED account.
+  pick="$(command neomax pick-orch --engine claude 2>/dev/null)"
+  if [[ -z "$pick" || ! -d "$pick" ]]; then
+    # fallback (neomax unavailable / nothing eligible): least-live logged-in, skip paused.
+    local best_n=999999 n
+    for p in "${PROFILES[@]}"; do
+      logged_in "$p" || continue
+      neomax paused --json 2>/dev/null | grep -q "\"$(basename "$p")\"" && continue  # skip paused
+      n=$(count_live "$p")
+      if (( n < best_n )); then pick=$p; best_n=$n; fi
+    done
+  fi
+  if [[ -z "$pick" ]]; then
+    print "cmax: no eligible account (all logged out / paused / weekly-exhausted) — falling back to ~/.claude."
+    print "      Add accounts with: cmax N  then  /login  ·  unpause with the dashboard or: neomax unpause N"
+    pick="$HOME/.claude"
+  fi
+fi
+
+print "cmax → $pick ($(count_live "$pick") other live session(s) on this account)"
+# CO-LOCATION GUARD: two interactive orchestrators on ONE account share Claude Code's
+# per-account state — notably the native `/goal` slot — so a goal set in one leaks into the
+# other ("◯ Goal not yet met" then demands the WRONG session's goal). The auto-pick already
+# steers around an occupied account; this still fires when you PIN a busy account (cmax N) or
+# when every account is taken — warn loudly so you can move to a free one.
+local _coloc
+_coloc="$(command neomax orch-on --dir "$pick" --engine claude 2>/dev/null)"
+if [[ "${_coloc:-0}" == <1-> ]]; then
+  print "⚠️  account $(acct_num "$pick") already has $_coloc live orchestrator session(s)."
+  print "    Two orchestrators on ONE account SHARE Claude Code's /goal + per-account state —"
+  print "    a /goal set in either cross-contaminates the other. Prefer a FREE account:"
+  print "    cmax <N>   (or the dedicated orchestrator account:  cmax orchestrator)."
+fi
+if [[ "$pick" == "$HOME/.claude" ]]; then
+  unset CLAUDE_CONFIG_DIR
+else
+  export CLAUDE_CONFIG_DIR="$pick"
+fi
+if [[ -n "${NEOMAX_DRY_RUN:-}" ]]; then print "DRY: claude --model $CLAUDE_MODEL --dangerously-skip-permissions $*"; exit 0; fi
+_register_orch
+command claude --model "$CLAUDE_MODEL" --dangerously-skip-permissions "$@"

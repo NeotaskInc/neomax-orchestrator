@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install shell dependency
+        run: sudo apt-get update && sudo apt-get install --yes zsh
+      - name: Run hermetic test suites
+        run: npm test
+      - name: Check Python and shell syntax
+        run: |
+          python3 -m py_compile lib/neomax_core.py lib/neomax/*.py tests/test_neomax.py tests/neomax_tests/*.py bin/neomax-portal
+          zsh -n bin/neomax bin/cmax bin/cdx bin/cdxmax bin/ocx bin/ocmax bin/kmx bin/kmax bin/gmx bin/gmax bin/neomax-usage-agent shell/neomax-aliases.zsh
+          bash -n install.sh uninstall.sh project/neomax-worktrees standalone-rotate/install.sh standalone-rotate/uninstall.sh
+      - name: Check portal JavaScript
+        run: |
+          python3 -c 'import pathlib,re,sys; source=pathlib.Path("bin/neomax-portal").read_text(); match=re.search(r"<script>(.*?)</script>", source, re.S); sys.stdout.write(match.group(1) if match else "")' | node --check
+      - name: Check committed whitespace
+        run: git show --check --format= HEAD

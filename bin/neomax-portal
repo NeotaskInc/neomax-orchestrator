@@ -1,0 +1,1156 @@
+#!/usr/bin/env python3
+"""neomax-portal — a tiny localhost dashboard for the multi-account orchestrator.
+
+Run on demand:  neomax-portal [PORT]   (default 8787) → open http://127.0.0.1:8787
+
+Dependency-free (python3 stdlib only), so it runs anywhere the repo is cloned.
+Shows every Claude, Codex, OpenCode, Kimi, and Grok account: auth, live sessions, provider
+usage windows when available, cooldowns, run ledger, and completion inbox. Lets you
+authenticate accounts and acknowledge/clean finished runs. All data comes from
+`neomax status --json` (one source of truth) — the portal renders, never
+duplicates logic.
+
+Binds to 127.0.0.1 only (local-only; never exposed).
+"""
+import http.server
+import json
+import os
+import re
+import socketserver
+import subprocess
+import sys
+import urllib.parse
+
+HOME = os.path.expanduser("~")
+SELF = os.path.dirname(os.path.abspath(__file__))
+NEOMAX = os.path.join(SELF, "neomax")
+CDX = os.path.join(SELF, "cdx")
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+
+
+def status_json():
+    try:
+        out = subprocess.run([NEOMAX, "status", "--json"],
+                             capture_output=True, text=True, timeout=20).stdout
+        return json.loads(out)
+    except Exception as e:
+        return {"error": str(e), "engines": {}, "runs": [], "inbox": 0, "now": 0}
+
+
+def history_json(limit=60):
+    try:
+        out = subprocess.run([NEOMAX, "history", "--json", str(limit)],
+                             capture_output=True, text=True, timeout=15).stdout
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def modes_json():
+    try:
+        out = subprocess.run([NEOMAX, "modes", "--json"],
+                             capture_output=True, text=True, timeout=15).stdout
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+def usage_json(days=30):
+    try:
+        out = subprocess.run([NEOMAX, "usage", "--json", "--days", str(days)],
+                             capture_output=True, text=True, timeout=20).stdout
+        return json.loads(out)
+    except Exception:
+        return {"grand": {}, "by_provider": [], "by_model": [], "by_account": [],
+                "by_date": [], "by_session": [], "by_agent": [], "opencode": [],
+                "kimi": [], "grok": []}
+
+
+_PR_CACHE = {}
+
+
+def pr_state(url):
+    """Live PR state via `gh pr view` (state/draft/merged), cached 120s per url so the
+    dashboard can label PR buttons without hammering GitHub. {} when gh/url unavailable."""
+    import time as _t
+    if not url or not re.match(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$", url):
+        return {}
+    hit = _PR_CACHE.get(url)
+    if hit and _t.time() - hit[0] < 120:
+        return hit[1]
+    out = {}
+    try:
+        r = subprocess.run(["gh", "pr", "view", url, "--json", "state,isDraft,mergedAt"],
+                           capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and r.stdout.strip():
+            d = json.loads(r.stdout)
+            out = {"state": d.get("state"), "isDraft": bool(d.get("isDraft")),
+                   "merged": bool(d.get("mergedAt"))}
+    except Exception:
+        pass
+    _PR_CACHE[url] = (_t.time(), out)
+    return out
+
+
+def sessions_json(days=3):
+    try:
+        out = subprocess.run([NEOMAX, "sessions", "--json", "--days", str(days)],
+                             capture_output=True, text=True, timeout=30).stdout
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def subagents_json(days=3):
+    try:
+        out = subprocess.run([NEOMAX, "subagents", "--json", "--days", str(days)],
+                             capture_output=True, text=True, timeout=60).stdout
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def rundiff_json(rid):
+    try:
+        r = subprocess.run([NEOMAX, "diff", rid, "--json"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)
+        return {"error": (r.stderr or "no diff available").strip()[-300:]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def run_log(rid):
+    """The worker stream-log for a run — live (from the active ledger) or archived
+    (history). Returned as text; capped so the browser stays responsive."""
+    # try the live log first (running/finished-but-not-cleaned), else the archive
+    for args in (["log", rid], ["history", rid, "--log"]):
+        try:
+            r = subprocess.run([NEOMAX] + args, capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout[-400000:]
+        except Exception:
+            pass
+    return ""
+
+
+PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
+<title>Neomax Orchestrator</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0a0a0a;--card:#101010;--card2:#151515;--line:#262626;--line2:#3d3d3d;
+--fg:#f2f2f2;--dim:#979797;--dim2:#646464;--accent:#ff5c00;
+--ok:#c9c9c9;--warn:#ff5c00;--bad:#ff5c00;--track:#1d1d1d;--barfill:#777;--barmid:#cfcfcf;--offdot:#333;--gold:#d4af37}
+/* Light mode — inverted: white bg, black text. Toggled via the header button. */
+:root[data-theme="light"]{--bg:#ffffff;--card:#f7f7f7;--card2:#ededed;--line:#dcdcdc;
+--line2:#bcbcbc;--fg:#0a0a0a;--dim:#555555;--dim2:#888888;--accent:#e24c00;
+--ok:#444444;--warn:#e24c00;--bad:#e24c00;--track:#e3e3e3;--barfill:#8a8a8a;--barmid:#555555;--offdot:#bdbdbd;--gold:#b8860b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:13px/1.45 -apple-system,Inter,system-ui,sans-serif;
+font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1240px;margin:0 auto;padding:20px}
+header{display:flex;justify-content:space-between;align-items:flex-end;
+padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid var(--line);flex-wrap:wrap;gap:8px}
+h1{font-size:15px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin:0}
+.sub{color:var(--dim2);font-size:11px;letter-spacing:.03em;margin-top:3px}
+.refresh{color:var(--dim2);font-size:10px;letter-spacing:.12em;text-transform:uppercase;display:flex;align-items:center;gap:7px}
+.refresh .live{width:7px;height:7px;border-radius:1px;background:var(--accent);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,92,0,.45)}70%{box-shadow:0 0 0 6px rgba(255,92,0,0)}100%{box-shadow:0 0 0 0 rgba(255,92,0,0)}}
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:12px}
+@media(max-width:880px){.stats{grid-template-columns:repeat(3,1fr)}}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:0;padding:10px 12px}
+.tile .v{font-size:22px;font-weight:700;line-height:1.1;letter-spacing:-.01em}
+.tile .l{color:var(--dim2);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;margin-top:4px}
+.tile.accent .v,.tile.warn .v,.tile.bad .v{color:var(--accent)}
+.tile.ok .v,.tile.violet .v{color:var(--fg)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+@media(max-width:880px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:0;padding:13px 14px;margin-bottom:12px}
+.card h2{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);
+margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid var(--line);
+display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.card h2 .hint{text-transform:none;letter-spacing:.02em;color:var(--dim2);font-size:10.5px;font-weight:400;text-align:right}
+.acct{display:flex;align-items:center;gap:11px;padding:10px 0;border-top:1px solid var(--line)}
+.acct.orch{border:2px solid var(--gold);border-radius:6px;padding:10px 12px;margin:6px 0;background:linear-gradient(90deg,rgba(212,175,55,.07),transparent)}
+.acct.orch.rotate{border-color:var(--accent);animation:orchpulse 1.8s infinite}
+@keyframes orchpulse{0%{box-shadow:0 0 0 0 rgba(255,92,0,.4)}70%{box-shadow:0 0 0 7px rgba(255,92,0,0)}100%{box-shadow:0 0 0 0 rgba(255,92,0,0)}}
+.chip.orch{border-color:var(--gold);color:var(--gold);font-weight:700}
+.acct:first-of-type{border-top:none}
+.dot{width:7px;height:7px;border-radius:1px;flex:none}
+.on{background:var(--fg)}.off{background:var(--offdot)}.cool{background:var(--accent)}.dot.paused{background:var(--dim2)}
+.acct.paused{opacity:.55}
+.acct.paused .who .nm::after{content:' · paused';color:var(--dim2);font-weight:400;font-size:10px;letter-spacing:.04em}
+.acct .who{min-width:170px}
+.acct .who .nm{font-weight:600;font-size:12.5px;letter-spacing:.01em}
+.acct .who .em{color:var(--dim2);font-size:11px;overflow:hidden;text-overflow:ellipsis;max-width:170px;white-space:nowrap}
+.acct .use{flex:1;font-size:11.5px;color:var(--dim)}
+.usline{display:flex;align-items:center;gap:8px}.usline+.usline{margin-top:3px}
+.uslbl{width:18px;color:var(--dim2);font-size:9.5px;letter-spacing:.08em}
+.bar{height:5px;border-radius:0;background:var(--track);overflow:hidden;flex:1;max-width:170px}
+.bar.sm{height:3px;max-width:130px}
+.bar>i{display:block;height:100%;background:var(--barfill);transition:width .4s}
+.bar>i.mid{background:var(--barmid)}.bar>i.hi{background:var(--accent)}
+.chip{font-size:10px;padding:1px 6px;border-radius:2px;border:1px solid var(--line2);color:var(--dim);white-space:nowrap;letter-spacing:.02em}
+.chip.plan{border-color:var(--line2);color:var(--fg)}
+.chip.live{border-color:var(--line2);color:var(--dim)}
+.chip.cool{border-color:var(--accent);color:var(--accent)}
+.chip.agents{border-color:var(--line2);color:var(--fg)}
+.chip.paused{border-color:var(--dim2);color:var(--dim2);font-weight:700}
+button.pausebtn.on{border-color:var(--dim2);color:var(--dim2)}
+button{background:transparent;color:var(--dim);border:1px solid var(--line2);border-radius:2px;
+padding:4px 10px;font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+button:hover{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+button.sm{padding:2px 7px;font-size:9.5px}
+button.active{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim2);font-weight:600;padding:5px 8px;border-bottom:1px solid var(--line);font-size:9.5px;text-transform:uppercase;letter-spacing:.1em}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:none}
+.pill{font-size:10px;padding:1px 6px;border-radius:2px;border:1px solid var(--line2)}
+.pill.inboxpill{border-color:var(--accent);color:var(--accent)}
+.s-done{color:var(--ok)}
+.s-running{color:var(--accent);font-weight:600}
+.s-error,.s-limit,.s-stalled,.s-timeout,.s-aborted,.s-interrupted{background:var(--fg);color:var(--bg);padding:0 5px;font-weight:700}
+.s-orphaned{border:1px solid var(--accent);color:var(--accent);padding:0 4px;font-weight:600}
+.badge{font-size:9.5px;padding:1px 5px;border-radius:1px;background:var(--card2);border:1px solid var(--line);color:var(--dim);margin-left:5px;letter-spacing:.04em;text-transform:uppercase}
+.badge.ultra{color:var(--fg);border-color:var(--fg)}
+.badge.opus{color:var(--fg);border-color:var(--line2)}
+.badge.tag{color:var(--dim);border-color:var(--line2);text-transform:none}
+.inbox{background:var(--fg);border:1px solid var(--fg);color:var(--bg);border-radius:0;padding:10px 14px;margin-bottom:12px;display:none;font-size:12px;font-weight:600;letter-spacing:.02em}
+.eng{font-size:11px;color:var(--dim);white-space:nowrap}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px}
+.muted{color:var(--dim2)}.tch{color:var(--dim2);font-size:10.5px;margin-top:3px}
+.taskcard{background:var(--card2);border:1px solid var(--line);border-radius:0;padding:11px 13px;margin-bottom:8px}
+.taskcard.orphaned{border-color:var(--accent)}
+.taskcard .top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.taskcard .pr{font-size:12.5px;font-weight:500}
+.taskcard .age{color:var(--fg);font-size:11.5px;font-weight:600}
+.taskcard .sub{color:var(--dim);font-size:11px;margin-top:5px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.spin{display:inline-block;width:8px;height:8px;border:1.5px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:sp .8s linear infinite;vertical-align:middle}
+@keyframes sp{to{transform:rotate(360deg)}}
+.children{margin-top:8px;padding-left:10px;border-left:1px solid var(--line2);display:flex;flex-direction:column;gap:4px}
+.child{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:6px}
+.child .clabel{color:var(--fg)}
+.histrow:hover{background:var(--card2)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;z-index:50}
+.modal.show{display:flex}
+.modalbox{background:var(--card);border:1px solid var(--line2);border-radius:0;width:min(960px,92vw);max-height:86vh;display:flex;flex-direction:column}
+.modalhead{display:flex;justify-content:space-between;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line)}
+.modalhead .t{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.logbox{overflow:auto;padding:13px 14px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:var(--dim)}
+.modesbody{overflow:auto;padding:13px 16px}
+.modesec{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin:16px 0 4px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+.moderow{padding:9px 0;border-bottom:1px solid var(--line)}
+.moderow:last-child{border-bottom:none}
+.mtitle{font-size:12.5px;font-weight:600}
+.cmd{display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;background:var(--card2);border:1px solid var(--line2);border-radius:2px;padding:3px 9px;cursor:pointer;color:var(--fg)}
+.cmd:hover{border-color:var(--fg)}
+.tabs{display:flex;gap:6px;margin-bottom:12px}
+.tab{padding:5px 13px;border:1px solid var(--line2);border-radius:0;cursor:pointer;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);background:var(--card)}
+.tab.active{color:var(--bg);background:var(--fg);border-color:var(--fg)}
+</style></head><body><div class=wrap>
+<header>
+  <div><h1>Neomax Orchestrator</h1><div class=sub>multi-account fleet — Claude + Codex + OpenCode + Kimi + Grok · <span id=clock></span><span id=scopeNote></span></div></div>
+  <div class=refresh><button id=quickBtn class=sm title="orchestration launch modes + account commands">Quick Actions</button><button id=themeBtn class=sm title="toggle light / dark">◐ Light</button><span class=live></span> live · refresh 5s</div>
+</header>
+<div class=stats id=stats></div>
+<div class=inbox id=inbox></div>
+<div class=inbox id=leanHint style="display:none"></div>
+<div class=inbox id=dupHint style="display:none"></div>
+<div class=banner id=rotbanner style="display:none"></div>
+<div class=banner id=authrot style="display:none"></div>
+<div class=card id=orchpanel style="display:none"><h2>Active orchestrators <span class=hint id=orchHint></span></h2><div id=orchList></div></div>
+<div class=card id=backlogpanel style="display:none"><h2>Backlog <span class=hint id=backlogHint></span></h2><div id=backlogList></div></div>
+<div class=grid>
+  <div class=card><h2>Claude accounts <span class=hint id=claudeHint>default · claude-fable-5[1m]</span></h2><div id=claudeAccts></div></div>
+  <div class=card><h2>Codex accounts <span class=hint id=codexHint>default · gpt-5.6-sol</span></h2><div id=codexAccts></div></div>
+  <div class=card><h2>OpenCode accounts <span class=hint id=opencodeHint>default · opencode-go/ox-alpha-free</span></h2><div id=opencodeAccts></div></div>
+  <div class=card><h2>Kimi accounts <span class=hint id=kimiHint>default · kimi-code/k3</span></h2><div id=kimiAccts></div></div>
+  <div class=card><h2>Grok accounts <span class=hint id=grokHint>default · grok-4.6</span></h2><div id=grokAccts></div></div>
+</div>
+<div class=card><h2>Tasks in progress <span class=hint id=runningCount></span></h2><div id=active></div></div>
+<div class=tabs id=tabs>
+  <div class="tab active" data-tab=ledger>Active ledger</div>
+  <div class=tab data-tab=history>History (all runs)</div>
+  <div class=tab data-tab=usage>Usage &amp; cost</div>
+  <span id=projFilter style="margin-left:auto;display:flex;gap:4px;align-items:center"></span>
+</div>
+<div class=card id=ledgerCard><h2>Run ledger <span class=hint id=ledgerCount></span></h2><div class=muted style="font-size:11px;margin:-4px 0 8px">orchestrator-dispatched (neomax) runs only — one row per delegated task; your own sessions from all five engines are under History → Interactive sessions</div><div id=runs></div></div>
+<div class=card id=historyCard style="display:none"><h2>Run history <span class=hint>every orchestrator-dispatched run ever — survives clean · click a row for its log</span></h2><div id=history></div>
+<div class=modesec style="margin-top:14px">Interactive sessions <span class=muted style="font-weight:400">(all five engines, last 3 days; exact locally recorded tokens)</span></div><div id=sessHist><div class=muted>loading…</div></div>
+<div class=modesec style="margin-top:14px">Sub-agent history <span class=muted style="font-weight:400">(Claude fleets plus OpenCode, Kimi, and Grok native child sessions, tokens, models, tools, and files)</span></div><div id=subHist><div class=muted>loading…</div></div></div>
+<div class=card id=usageCard style="display:none"><h2>Usage &amp; cost <span class=hint style="color:var(--fg);font-weight:600">all five engines · tokens exact · provider-reported Grok cost when available</span></h2>
+<div style="display:flex;gap:6px;margin-bottom:10px"><button class=sm data-usagedays=7>7d</button><button class="sm active" data-usagedays=30>30d</button><button class=sm data-usagedays=0>All</button></div>
+<div class=stats id=usageTiles></div>
+<div id=usageBody><div class=muted>loading…</div></div></div>
+<div class=modal id=logModal><div class=modalbox>
+  <div class=modalhead><span class=t id=logTitle>log</span><button class=sm id=logClose>close</button></div>
+  <div class=logbox id=logBody>loading…</div>
+</div></div>
+<div class=modal id=modesModal><div class=modalbox>
+  <div class=modalhead><span class=t>Quick Actions</span><button class=sm id=modesClose>close</button></div>
+  <div class=modesbody id=modesBody><div class=muted>loading…</div></div>
+</div></div>
+<script>
+var DATA=null;
+function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function nowS(){return Math.floor(Date.now()/1000)}
+function fmtAge(sec){sec=Math.max(0,sec|0);if(sec<60)return sec+'s';var m=(sec/60)|0;if(m<60)return m+'m '+(sec%60)+'s';var h=(m/60)|0;if(h<24)return h+'h '+(m%60)+'m';return ((h/24)|0)+'d '+(h%24)+'h'}
+function clockTime(t){var d=new Date(t*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+// reset label: time only if it's today, else weekday + month/day + time (so a 7-day
+// window — days out — shows the date, not just a time).
+function resetLabel(t){var d=new Date(t*1000),n=new Date();
+  if(d.toDateString()===n.toDateString())return clockTime(t);
+  return d.toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}
+function barCls(p){return p>=85?'hi':(p>=60?'mid':'')}
+function projBadge(p){if(!p)return '';var cs=['var(--accent)','#7b5aff','#12a594','#d18b00'],h=0;for(var i=0;i<p.length;i++)h=(h*31+p.charCodeAt(i))>>>0;var c=cs[h%cs.length];return '<span class=chip style="border-color:'+c+';color:'+c+'" title="project: '+esc(p)+'">'+esc(p)+'</span>'}
+function fmtTok(n){n=n||0;if(n>=1e9)return +(n/1e9).toFixed(2)+'B';if(n>=1e6)return +(n/1e6).toFixed(1)+'M';if(n>=1000)return +(n/1000).toFixed(1)+'k';return String(n)}
+// input / output / cache breakdown (cache shown only when present). "—" if nothing yet.
+function fmtTokParts(t){t=t||{};var p=[];if(t.in)p.push(fmtTok(t.in)+' in');if(t.out)p.push(fmtTok(t.out)+' out');if(t.cache)p.push(fmtTok(t.cache)+' cache');return p.join(' · ')||'—'}
+function fmtTokBreak(t,title){t=t||{};if(!(t.in||t.out||t.cache))return '';return ' · <span class=eng title="'+(title||'')+'">'+fmtTokParts(t)+'</span>'}
+function fmtUsd(v){return '$'+(v||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
+function shortModel(m){return m?String(m).replace(/^claude-/,''):''}
+function usage(a,eng){
+  if(a.token_expired)return '<span class=muted title="this account\'s access token expired (Claude tokens are short-lived). Re-login to refresh it.">token expired — re-login: '+(a.n==='orch'?(eng==='claude'?'cmax orchestrator':'cdx orch'):(eng==='claude'?'cmax '+a.n:'cdx login '+a.n))+' → /login</span>';
+  if(eng==='opencode'){
+    var tel=a.telemetry||{},t=tel.totals||{};
+    if(!tel.available)return '<span class=muted title="'+esc(tel.error||'No opencode.db exists for this profile yet')+'">local telemetry unavailable — start an OpenCode session on this profile</span>';
+    var last=t.last_activity?new Date(t.last_activity*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+    var models=(tel.models||[]).map(function(m){return m.model+': '+fmtTok(m.out||0)+' out / '+fmtTok(m.in||0)+' in'}).join('\n');
+    return '<div title="'+esc(models)+'"><div style="color:var(--fg);font-weight:650">7D · '+fmtTok(t.out||0)+' output · '+fmtTok(t.in||0)+' input · '+fmtTok(t.reasoning||0)+' reasoning</div>'+
+      '<div class=muted>'+fmtTok((t.cr||0)+(t.cw||0))+' cache · '+fmtTok(t.completions||0)+'/'+fmtTok(t.requests||0)+' completed/requests · '+fmtTok(t.unfinished||0)+' unfinished</div>'+
+      '<div class=muted>'+fmtTok(t.errors||0)+' failures · '+fmtTok(t.rate_limits||0)+' rate limits · '+fmtTok(t.sessions||0)+' sessions · '+fmtTok(t.native_subagents||0)+' native subagents</div>'+
+      '<div class=muted>'+fmtTok(t.tool_calls||0)+' tools ('+fmtTok(t.tool_errors||0)+' errors) · '+fmtTok(t.files||0)+' files · <span style="color:var(--ok)">+'+fmtTok(t.adds||0)+'</span>/<span style="color:var(--accent)">−'+fmtTok(t.dels||0)+'</span> lines · last '+esc(last)+'</div>'+
+      '<div class=muted title="OpenCode publishes no account quota ceiling, so no percentage is invented">local opencode.db · exact activity, no published quota cap</div></div>';
+  }
+  if(eng==='kimi'){
+    var kt=a.telemetry||{},k=kt.totals||{};
+    if(!kt.available)return '<span class=muted>local telemetry unavailable — start a Kimi session on this profile</span>';
+    return '<div><div style="color:var(--fg);font-weight:650">7D · '+fmtTok(k.out||0)+' output · '+fmtTok(k.in||0)+' input</div>'+
+      '<div class=muted>'+fmtTok((k.cr||0)+(k.cw||0))+' cache · '+fmtTok(k.completions||0)+'/'+fmtTok(k.requests||0)+' completed/requests</div>'+
+      '<div class=muted>'+fmtTok(k.errors||0)+' failures · '+fmtTok(k.rate_limits||0)+' rate limits · '+fmtTok(k.sessions||0)+' sessions · '+fmtTok(k.native_subagents||0)+' native subagents</div>'+
+      '<div class=muted>'+fmtTok(k.tool_calls||0)+' tools ('+fmtTok(k.tool_errors||0)+' errors) · '+fmtTok(k.files||0)+' files</div>'+
+      '<div class=muted title="Kimi exposes no documented account quota ceiling">local Kimi wire logs · exact activity, no published quota cap</div></div>';
+  }
+  if(eng==='grok'){
+    var gt=a.telemetry||{},g=gt.totals||{};
+    if(!gt.available)return '<span class=muted>local telemetry unavailable — start a Grok session on this profile</span>';
+    return '<div><div style="color:var(--fg);font-weight:650">7D · '+fmtTok(g.out||0)+' output · '+fmtTok(g.in||0)+' input · '+fmtTok(g.reasoning||0)+' reasoning</div>'+
+      '<div class=muted>'+fmtTok((g.cr||0)+(g.cw||0))+' cache · '+fmtTok(g.completions||0)+'/'+fmtTok(g.requests||0)+' completed/requests</div>'+
+      '<div class=muted>'+fmtTok(g.errors||0)+' failures · '+fmtTok(g.rate_limits||0)+' rate limits · '+fmtTok(g.sessions||0)+' sessions · '+fmtTok(g.native_subagents||0)+' native subagents</div>'+
+      '<div class=muted>'+fmtTok(g.tool_calls||0)+' tools ('+fmtTok(g.tool_errors||0)+' errors) · '+fmtTok(g.files||0)+' files</div>'+
+      '<div class=muted title="xAI exposes no documented account quota ceiling in Grok Build">local Grok session JSONL · exact activity, no published quota cap</div></div>';
+  }
+  var u=a.usage||{},five=u.five_hour||{},sev=u.seven_day||{},now=nowS(),h='';
+  var st=u.stale?' <span class=muted title="last known reading — live fetch briefly unavailable">·last known</span>':'';
+  function line(lbl,w,cls,extra){
+    if(w.used_percent==null)return '';
+    var p=Math.round(w.used_percent),reset='';
+    if(w.resets_at&&w.resets_at>now)reset=' <span class=muted>resets '+resetLabel(w.resets_at)+'</span>';
+    return '<div class=usline><span class=uslbl>'+lbl+'</span><span class="bar '+cls+'"><i class="'+barCls(p)+'" style="width:'+Math.min(100,p)+'%"></i></span><span>'+p+'%'+reset+(extra||'')+'</span></div>';
+  }
+  h+=line('5H',five,'',st);h+=line('7D',sev,'sm');
+  return h||'<span class=muted title="no per-account reading is available right now — shown as unknown rather than a number from another account">usage unknown — open '+(a.n==='orch'?(eng==='claude'?'cmax orchestrator':'cdx orch'):(eng==='claude'?'cmax '+a.n:'cdxmax '+a.n))+' once</span>';
+}
+function acctRow(eng,a,now){
+  var cls=a.authenticated?(a.paused?'paused':(a.cooldown_until>now?'cool':'on')):'off';
+  var chips='';var pbtn='';
+  if(a.authenticated){
+    if(a.plan)chips+='<span class="chip plan">'+esc(a.plan)+'</span> ';
+    if(a.auth_method)chips+='<span class="chip">'+esc(a.auth_method)+'</span> ';
+    if(a.worker_eligible===false)chips+='<span class="chip cool" title="This API-key profile works in the native Kimi CLI. Managed K3/K2.7 Neomax workers require Kimi Code OAuth.">native CLI only · OAuth required for K3 pool</span> ';
+    chips+='<span class="chip live">'+a.live+' live</span> ';
+    if(a.agents>0)chips+='<span class="chip agents" title="'+(a.workers||0)+' worker(s) + '+(a.mains||0)+' active main session(s) + '+(a.subagents||0)+' sub-agent(s) drawing on this account now">'+(a.workers||0)+'w + '+(a.mains||0)+'m + '+(a.subagents||0)+'s = '+a.agents+(a.agents===1?' agent':' agents')+'</span> ';
+    if(a.cooldown_until>now)chips+='<span class="chip cool">cooldown '+fmtAge(a.cooldown_until-now)+' → '+clockTime(a.cooldown_until)+'</span>';
+    if(a.paused)chips='<span class="chip paused" title="PAUSED — no tasks will be dispatched to this account until you unpause it. It stays logged in; toggle anytime, takes effect immediately (no orchestrator restart).">⏸ PAUSED — no dispatch</span> '+chips;
+    // toggle in/out of dispatch — live, keeps the account logged in
+    pbtn=' <button class="sm pausebtn'+(a.paused?' on':'')+'" data-p-eng="'+eng+'" data-p-n="'+a.n+'" data-p-on="'+(a.paused?0:1)+'" title="'+(a.paused?'Resume dispatching tasks to this account':'Stop dispatching tasks to this account (keeps it logged in; live, no restart)')+'">'+(a.paused?'Unpause':'Pause')+'</button>';
+  }
+  var isOrch=(a.role==='orchestrator'||a.n==='orch');
+  // Codex removed its 5h limit — it rotates on WEEKLY only, so don't claim a 5h trigger there.
+  if(a.rotate_advised){var rtrig=(eng==='codex')?'≥99% weekly (Codex has no 5h window)':'≥99% 5h or ≥99% weekly';
+    chips='<span class="chip cool" title="this account is at '+rtrig+' — any heavy session on it (orchestrator, sub-agent fleets, workflows) should rotate: run `neomax handoff` in that session (handoff --check to test)">ROTATE ADVISED</span> '+chips;}
+  var nm=(isOrch?'orchestrator':'acct '+a.n)+(a.display_name?' — '+esc(a.display_name):'');
+  if(isOrch&&a.authenticated)chips='<span class="chip orch" title="ISOLATED ORCHESTRATOR account — when launched with --orchestrator it is reserved (excluded from the worker pool) and ONLY orchestrates; the gold border tracks this slot. Monitor its usage here; rotate it in place with `neomax rotate-auth orch --from <fresh-acct>` so the orchestrator keeps going on fresh quota (the AUTH ROTATIONS banner shows when it happens).">★ ISOLATED ORCHESTRATOR</span> '+chips;
+  var who='<div class=who><div class=nm title="'+esc(a.dir||'')+'">'+nm+'</div><div class=em title="'+esc(a.email||'')+'">'+(a.email?esc(a.email):'<span class=muted>—</span>')+'</div></div>';
+  var right;
+  if(a.authenticated){right='<div class=use>'+usage(a,eng)+'<div style="margin-top:6px">'+chips+pbtn+'</div></div>';}
+  else{right='<div class=use><span class=muted>not signed in</span></div><button class=sm data-c-eng="'+eng+'" data-c-n="'+a.n+'">Connect</button>';}
+  var cardcls='acct'+(isOrch&&a.authenticated?' orch'+(a.rotate_advised?' rotate':''):'')+(a.paused?' paused':'');
+  return '<div class="'+cardcls+'"><span class="dot '+cls+'"></span>'+who+right+'</div>';
+}
+function fleet(eng,accts){
+  var by={},mx=((eng==='opencode'||eng==='kimi'||eng==='grok')?1:3);accts.forEach(function(a){by[a.n]=a;if(typeof a.n==='number'&&a.n>mx)mx=a.n});
+  var out=[];for(var i=1;i<=mx;i++){out.push(by[i]||{n:i,engine:eng,authenticated:false,live:0,cooldown_until:0,usage:null})}
+  // the dedicated orchestrator account is keyed 'orch' (a string), NOT a numeric slot — the
+  // numeric loop above can't emit it. Append it so its gold ISOLATED ORCHESTRATOR card renders.
+  if(by['orch'])out.push(by['orch']);
+  return out;
+}
+function badges(r){
+  var b='';if(r.ultra)b+='<span class="badge ultra">ultra</span>';if(r.opus)b+='<span class="badge opus">opus 4.8</span>';
+  if(r.effort)b+='<span class=badge>'+r.effort+'</span>';if(r.attempt>1)b+='<span class=badge>try '+r.attempt+'</span>';
+  if(r.tag)b+='<span class="badge tag" title="fan-out plan">'+esc(r.tag)+'</span>';
+  if(r.goal)b+='<span class="badge tag" title="goal: '+esc(r.goal)+'">goal</span>';
+  return b;
+}
+function btnsFor(r){
+  var b='';
+  if(['stalled','timeout','aborted','interrupted'].indexOf(r.status)>=0)b+='<button class=sm data-act=resume data-id="'+r.id+'">resume</button> ';
+  else if(['error','limit'].indexOf(r.status)>=0)b+='<button class=sm data-act=retry data-id="'+r.id+'">retry</button> ';
+  else if(r.status==='orphaned')b+='<button class=sm data-act=kill data-id="'+r.id+'">kill</button> ';
+  var terminal=['done','error','limit','stalled','timeout','aborted','interrupted'].indexOf(r.status)>=0;
+  if(terminal&&!r.acknowledged)b+='<button class=sm data-act=ack data-id="'+r.id+'">ack</button> ';
+  if(r.status==='done')b+='<button class=sm data-act=clean data-id="'+r.id+'">clean</button> ';
+  if(r.branch&&r.worktree_state!=='cleaned')b+='<button class=sm data-diff="'+r.id+'">diff</button> ';
+  if(r.pr_url)b+='<a href="'+esc(r.pr_url)+'" target=_blank><button class=sm data-pr="'+esc(r.pr_url)+'">PR ↗</button></a>';
+  return b;
+}
+function childRow(c){
+  var st=c.status==='running'?'<span class=spin></span>':(c.status==='error'?'<span style="color:var(--bad)">✗</span>':'<span style="color:var(--ok)">✓</span>');
+  var tool=c.last_tool?(' <span class=muted>· '+esc(c.last_tool)+'</span>'):'';
+  var tok=c.tokens?(' <span class=muted>· '+fmtTok(c.tokens)+' tok</span>'):'';
+  return '<div class=child>'+st+' <span class=clabel>'+esc(c.label||c.id||'agent')+'</span>'+tool+tok+'</div>';
+}
+function taskCard(r,now){
+  var age=fmtAge(now-(r.started||now));
+  var meta=[];if(r.project)meta.push(projBadge(r.project));meta.push('<span class=eng>'+r.engine+' · acct '+r.acct_no+(r.account?(' <span class=muted>('+esc(r.account)+')</span>'):'')+'</span>');
+  if(r.model)meta.push('<span class=eng>'+esc(shortModel(r.model))+'</span>');
+  if(r.session)meta.push('<span class="eng mono" title="session '+esc(r.session)+'">#'+esc(String(r.session).slice(0,8))+'</span>');
+  var nact=(r.child_list||[]).filter(function(c){return c.status==='running'}).length;
+  var isStep=(r.child_list||[]).length&&(r.child_list||[]).every(function(c){return c.kind==='step'});
+  if(r.children)meta.push('<span class=eng>'+(nact?(nact+' active / '):'')+r.children+(isStep?' steps':' sub-agents')+'</span>');
+  var tok=(r.child_list||[]).reduce(function(s,c){return s+(c.tokens||0)},0);
+  if(tok)meta.push('<span class=eng>'+fmtTok(tok)+' sub-agent tok</span>');
+  if(r.repo)meta.push('<span class=eng>'+esc(r.repo)+'</span>');
+  if(r.branch)meta.push('<span class="eng mono">'+esc(r.branch)+'</span>');
+  if(r.worktree)meta.push('<span class="eng mono" title="'+esc(r.worktree)+'">wt:…/'+esc(String(r.worktree).split('/').slice(-2).join('/'))+'</span>');
+  if(r.worktree_state)meta.push('<span class=badge title="worktree state">'+esc(r.worktree_state)+'</span>');
+  var tch=(r.files_touched&&r.files_touched.length)?'<div class=tch>files: '+esc(r.files_touched.slice(0,5).join(', '))+(r.files_touched.length>5?' …':'')+'</div>':'';
+  var kids=(r.child_list&&r.child_list.length)?'<div class=children>'+r.child_list.map(childRow).join('')+'</div>':'';
+  return '<div class="taskcard '+(r.status==='orphaned'?'orphaned':'')+'">'+
+    '<div class=top><div class=pr>'+(r.status==='running'?'<span class=spin></span> ':'')+esc(r.prompt)+'</div><div class=age>'+age+'</div></div>'+
+    '<div class=sub>'+meta.join('')+badges(r)+'</div>'+tch+kids+
+    '<div style="margin-top:7px">'+btnsFor(r)+' <button class=sm data-log="'+r.id+'">log</button></div></div>';
+}
+function runRow(r,now){
+  var ack=r.acknowledged?'':' <span class="pill inboxpill">inbox</span>';
+  var sub=r.children?(' <span class=eng>+'+r.children+'</span>'):'';
+  var ln2=[shortModel(r.model),r.effort].filter(Boolean).join(' · ');
+  return '<tr data-proj="'+esc(r.project||'')+'"><td><span class="s-'+r.status+'">'+r.status+'</span>'+ack+'</td>'+
+    '<td class=eng>'+fmtAge(now-(r.started||now))+'</td>'+
+    '<td class=eng>'+(r.project?projBadge(r.project)+' ':'')+r.engine.slice(0,3)+'/'+r.acct_no+sub+(ln2?'<div class=tch>'+esc(ln2)+'</div>':'')+'</td>'+
+    '<td>'+esc(r.prompt)+(r.branch?'<div class="tch mono">'+esc(r.branch)+(r.worktree_state?' · '+esc(r.worktree_state):'')+'</div>':'')+'</td>'+
+    '<td style="text-align:right;white-space:nowrap">'+btnsFor(r)+'</td></tr>';
+}
+function tile(v,l,cls){return '<div class="tile '+(cls||'')+'"><div class=v>'+v+'</div><div class=l>'+l+'</div></div>'}
+function engHint(eng,accts){
+  var up=0,lv=0,ag=0,out=0,req=0;
+  accts.forEach(function(a){if(a.authenticated)up++;lv+=a.live||0;ag+=a.agents||0;var t=((a.telemetry||{}).totals||{});out+=t.out||0;req+=t.requests||0});
+  return (eng==='claude'?'Fable 5':(eng==='codex'?'gpt-5.6':(eng==='opencode'?'OX Alpha Free':(eng==='kimi'?'K3 / K2.7':'Grok Build'))))+' · '+up+'/'+accts.length+' up · '+lv+' live · '+ag+(ag===1?' agent':' agents')+((eng==='opencode'||eng==='kimi'||eng==='grok')?' · 7d '+fmtTok(out)+' out / '+fmtTok(req)+' requests':'');
+}
+function render(){
+  if(!DATA)return;var s=DATA,now=nowS();
+  document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+  var sm=s.summary||{};
+  var sc=sm.fleet_scope||[];
+  document.getElementById('scopeNote').textContent=
+    (sc.length&&sc.length<5)?(' · scope: '+sc.join('+')+'-only'):'';
+  var agentsCell=(sm.agents_total||0)+(sm.subagents?'<span style="font-size:12px;color:var(--dim)"> ('+sm.subagents+' sub)</span>':'');
+  document.getElementById('stats').innerHTML=
+    tile(sm.running||0,'tasks running',(sm.running?'accent':''))+
+    tile(agentsCell,'total agents','')+
+    tile(sm.live_total||0,'live sessions','')+
+    tile((sm.accounts_up||0)+'<span style="font-size:13px;color:var(--dim2)">/'+(sm.accounts_total||0)+'</span>','accounts up','')+
+    tile(sm.cooling||0,'cooling down',(sm.cooling?'warn':''))+
+    tile(sm.inbox||0,'inbox',(sm.inbox?'warn':''));
+  ['claude','codex','opencode','kimi','grok'].forEach(function(eng){
+    var real=(s.engines[eng]||{accounts:[]}).accounts;
+    var hint=document.getElementById(eng+'Hint');
+    if(hint&&real.length)hint.textContent=engHint(eng,real);
+    var accts=fleet(eng,real);
+    document.getElementById(eng+'Accts').innerHTML=accts.map(function(a){return acctRow(eng,a,now)}).join('');
+  });
+  var ib=document.getElementById('inbox');
+  if(s.inbox){ib.style.display='block';ib.innerHTML='COMPLETION INBOX — '+s.inbox+' finished run(s) awaiting acknowledgement. Ack or clean them below so nothing is missed.';}
+  else ib.style.display='none';
+  var lean=document.getElementById('leanHint');
+  if(sm.claude_weekly_exhausted){lean.style.display='block';lean.innerHTML='CLAUDE WEEKLY POOL EXHAUSTED — every Claude account ≥99% weekly. Selection refuses; in-flight tasks auto-continue on Codex (cross-engine). Reopens at the weekly resets.';}
+  else if(sm.codex_weekly_exhausted){lean.style.display='block';lean.innerHTML='CODEX WEEKLY POOL EXHAUSTED — every Codex account ≥99% weekly. In-flight tasks auto-continue on Claude.';}
+  else if(sm.claude_weekly_soft){lean.style.display='block';lean.innerHTML='CLAUDE WEEKLY SOFT BAND — every Claude account ≥95% weekly (freshest: '+sm.claude_weekly_min+'%). Still running: selection uses the freshest until 99%, rotating through the band.';}
+  else if(sm.codex_weekly_soft){lean.style.display='block';lean.innerHTML='CODEX WEEKLY SOFT BAND — every Codex account ≥95% weekly (freshest: '+sm.codex_weekly_min+'%). Still running until 99%.';}
+  else lean.style.display='none';
+  var dup=document.getElementById('dupHint'),dups=sm.duplicate_accounts||[];
+  if(dups.length){
+    dup.style.display='block';
+    dup.innerHTML='DUPLICATE LOGIN — '+dups.map(function(em){
+      var ns=[];
+      ['claude','codex'].forEach(function(eng){
+        ((s.engines[eng]||{}).accounts||[]).forEach(function(a){
+          if(a.email!==em)return;
+          (a.duplicate_of||[]).concat([a.n]).forEach(function(n){if(ns.indexOf(n)<0)ns.push(n)});
+        });
+      });
+      ns.sort(function(x,y){return x-y});
+      return esc(em)+' is signed into '+(ns.length||2)+' profiles'+(ns.length?' (accounts '+ns.join(' & ')+')':'');
+    }).join(' · ')+'; they share one usage pool. Re-login one: cmax N → /login.';
+  }
+  else dup.style.display='none';
+  var ar=(s.summary&&s.summary.auth_rotations||[]);
+  var arEl=document.getElementById('authrot');
+  if(arEl){
+    if(ar.length){arEl.style.display='block';
+      arEl.innerHTML='AUTH ROTATIONS (last 6h) — '+ar.map(function(x){
+        var t=new Date((x.ts||0)*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+        return t+': '+esc(x.dest||'')+' → '+esc(x.to_email||x.src||'')+(x.reason&&x.reason!=='manual'?' ('+esc(x.reason)+')':'');
+      }).join(' · ');}
+    else arEl.style.display='none';
+  }
+  // Active orchestrators panel — concurrent Neomax provider sessions (separate terminals)
+  var orchs=(s.orchestrators||[]).filter(function(o){return o.live});
+  var opEl=document.getElementById('orchpanel');
+  if(opEl){
+    if(orchs.length>=1){
+      opEl.style.display='block';
+      document.getElementById('orchHint').textContent=(orchs.length>1
+        ?orchs.length+' running in parallel — each owns its own runs; coordinate merges to a shared main'
+        :'1 active — owns its own runs');
+      var runsByOrch={};(s.runs||[]).forEach(function(r){if(r.status==='running'||r.status==='orphaned')runsByOrch[r.orch_session]=(runsByOrch[r.orch_session]||0)+1});
+      document.getElementById('orchList').innerHTML=orchs.map(function(o){
+        var idle=Math.max(0,(s.now||0)-(o.last_seen||0));
+        var proj=o.project?esc(o.project):'<span class=muted>multi / no project</span>';
+        var pref=o.branch_prefix?('<span class="chip" title="branch namespace">'+esc(o.branch_prefix)+'/</span>'):'';
+        var rn=runsByOrch[o.session]||0;
+        return '<div class=acct><span class="dot on"></span>'+
+          '<div class=who><div class=nm>'+esc(o.engine)+' · acct '+esc(String(o.account))+(o.reserved?' <span class="chip orch">reserved</span>':'')+'</div>'+
+          '<div class=em title="'+esc(o.cwd||'')+'">'+proj+'</div></div>'+
+          '<div class=use><div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">'+pref+
+          (o.model?'<span class="chip mono" title="selected orchestrator model">'+esc(o.model)+'</span>':'')+
+          '<span class=chip>'+rn+' run'+(rn===1?'':'s')+' in flight</span>'+
+          '<span class=chip title="last active">idle '+fmtAge(idle)+'</span>'+
+          '<span class="chip mono" title="orchestrator session id">'+esc(String(o.session||'').slice(0,22))+'</span>'+
+          '</div></div></div>';
+      }).join('');
+    } else opEl.style.display='none';
+  }
+  // Backlog panel — the durable task list (neomax task): the orchestrator's source of truth.
+  var tasks=(s.tasks||[]);
+  var OPEN={todo:1,doing:1,blocked:1};
+  var openTasks=tasks.filter(function(t){return OPEN[t.status]});
+  var bpEl=document.getElementById('backlogpanel');
+  if(bpEl){
+    if(tasks.length){
+      bpEl.style.display='block';
+      var doneN=tasks.length-openTasks.length;
+      document.getElementById('backlogHint').textContent=openTasks.length+' open · '+doneN+' resolved';
+      var ord={doing:0,blocked:1,todo:2,done:3,merged:4,dropped:5};
+      var shown=tasks.slice().filter(function(t){return OPEN[t.status]||t.status==='done'||t.status==='merged'});
+      shown.sort(function(a,b){return (ord[a.status]==null?9:ord[a.status])-(ord[b.status]==null?9:ord[b.status])||(b.updated||0)-(a.updated||0)});
+      var SC={doing:'on',blocked:'warn',todo:'',done:'muted',merged:'muted',dropped:'muted'};
+      document.getElementById('backlogList').innerHTML=shown.slice(0,40).map(function(t){
+        var dim=(t.status==='done'||t.status==='merged'||t.status==='dropped');
+        var runs=(t.runs&&t.runs.length)?('<span class="chip mono" title="linked run">'+esc(t.runs[0])+'</span>'):'';
+        var pj=t.project?('<span class=chip>'+esc(t.project)+'</span>'):'';
+        return '<div class=acct'+(dim?' style="opacity:.5"':'')+'>'+
+          '<div class=who><div class=nm>'+esc(t.id)+' · '+esc(t.title||'')+'</div>'+
+          '<div class=em>'+esc((t.notes&&t.notes.length)?t.notes[t.notes.length-1]:'')+'</div></div>'+
+          '<div class=use><div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">'+pj+runs+
+          '<span class="chip" title="status">'+esc((t.status||'todo').toUpperCase())+'</span>'+
+          '</div></div></div>';
+      }).join('');
+    } else bpEl.style.display='none';
+  }
+  var rot=(s.summary&&s.summary.rotate_advised||[]).filter(function(x){return (x.live||0)>0||(x.agents||0)>0});
+  var rotEl=document.getElementById('rotbanner');
+  if(rotEl){
+    if(rot.length){rotEl.style.display='block';
+      var anyClaude=rot.some(function(x){return x.engine!=='codex'});
+      var trig=anyClaude?'≥99% 5h / ≥99% weekly':'≥99% weekly';
+      rotEl.innerHTML='ROTATION ADVISED — '+rot.map(function(x){return x.engine+' acct '+x.n+' ('+(x.live||0)+' live, '+(x.agents||0)+' agents)'}).join(' · ')+' is '+trig+' with active sessions. Run `neomax handoff` in those sessions to rotate onto a fresher account.';}
+    else rotEl.style.display='none';
+  }
+  var runs=s.runs||[],active=runs.filter(function(r){return r.status==='running'||r.status==='orphaned'});
+  var amb=s.ambient||[];
+  var ambWorking=amb.reduce(function(t,x){return t+(x.agents||[]).filter(function(a){return a.working}).length},0);
+  var rcParts=[];
+  if(active.length)rcParts.push(active.length+' dispatched');
+  if(amb.length)rcParts.push(amb.length+' interactive session'+(amb.length>1?'s':''));
+  if(ambWorking)rcParts.push(ambWorking+' sub-agent'+(ambWorking>1?'s':'')+' working');
+  document.getElementById('runningCount').textContent=rcParts.join(' · ')||'idle';
+  var ambHtml=amb.length?
+    '<div class=modesec style="margin-top:10px">Interactive sessions <span class=muted style="font-weight:400">(your own sessions across all five engines — not orchestrator-dispatched)</span></div>'+
+    amb.map(function(x){
+      var where=(x.cwd||'').split('/').slice(-2).join('/');
+      var nWork=(x.agents||[]).filter(function(a){return a.working}).length,nDone=x.agents.length-nWork;
+      var subBreak=x.agents.length?' <span class=muted style="font-weight:400">('+(nWork?nWork+' working':'')+(nWork&&nDone?', ':'')+(nDone?nDone+' done':'')+')</span>':'';
+      var subs=x.agents.length?' · <b>'+x.agents.length+' sub-agent'+(x.agents.length>1?'s':'')+'</b>'+subBreak:'';
+      var age=(x.age_s!=null)?' · <span class=muted>active '+(x.age_s<5?'now':x.age_s+'s ago')+'</span>':'';
+      // tokens split input / output / cache. Main/orchestrator agent's own (x.tok) + a sub-agent rollup.
+      var mainTok=fmtTokBreak(x.tok,'this session’s own tokens (the orchestrator/main agent) — input / output / cache');
+      var roll={in:0,out:0,cache:0};(x.agents||[]).forEach(function(a){var t=a.tok||{};roll.in+=t.in||0;roll.out+=t.out||0;roll.cache+=t.cache||0});
+      var subTokChip=(roll.in||roll.out||roll.cache)?' · <span class=eng title="across this session’s sub-agents — input / output / cache">+'+fmtTokParts(roll)+' sub-agent</span>':'';
+      var who=(x.acct_no==='solo')?esc(x.engine||'claude')+' <span class="chip" title="cmax solo session — single account, in-session sub-agents, no delegation">SOLO</span>':esc(x.engine||'claude')+' acct '+x.acct_no;
+      var modelTag=x.model?' · <span class="eng mono">'+esc(shortModel(x.model))+'</span>':'';
+      return '<div style="border:1px solid var(--line);padding:10px 12px;margin-bottom:8px">'+
+        (x.project?projBadge(x.project)+' ':'')+'<b>'+who+'</b> · session '+esc(String(x.session||'').slice(0,8))+
+        (where?' · <span class=muted>'+esc(where)+'</span>':'')+
+        (x.branch?' · <code style="font-size:11px">'+esc(x.branch)+'</code>':'')+
+        modelTag+' · working'+subs+mainTok+subTokChip+age+
+        (x.label?'<div class=muted style="margin:4px 0 0 2px;font-size:12px">→ '+esc(x.label)+'</div>':'')+
+        x.agents.map(function(a){
+          var wftag=a.wf?'<code style="font-size:10px" title="spawned by a Workflow (ultracode) run">'+esc(String(a.wf).slice(0,11))+'</code> ':'';
+          var atok=fmtTokBreak(a.tok,'this sub-agent — input / output / cache');
+          var amodel=a.model?' <span class="eng mono">'+esc(shortModel(a.model))+'</span>':'';
+          var badge=a.working?'<span class=eng title="writing now">▸ working</span> ':'<span class=muted title="finished its turn — workflow still in progress">✓ done</span> ';
+          var ageTag=(a.age_s!=null&&!a.working)?' <span class=muted style="font-size:11px">'+(a.age_s<60?a.age_s+'s':Math.round(a.age_s/60)+'m')+' ago</span>':'';
+          return '<div class=muted style="margin:4px 0 0 12px;font-size:12px">'+badge+wftag+esc(a.label||'(agent)')+amodel+atok+ageTag+'</div>'}).join('')+
+        '</div>';
+    }).join(''):'';
+  document.getElementById('active').innerHTML=
+    (active.length?active.map(function(r){return taskCard(r,now)}).join(''):
+      (amb.length?'':'<div class=muted>no tasks in flight — the orchestrator will fill lanes as work is dispatched</div>'))+ambHtml;
+  document.getElementById('ledgerCount').textContent=runs.length+' total';
+  document.getElementById('runs').innerHTML=runs.length?
+    '<table><tr><th>status</th><th>age</th><th>eng/acct</th><th>task</th><th></th></tr>'+runs.map(function(r){return runRow(r,now)}).join('')+'</table>':
+    '<div class=muted>no runs recorded yet</div>';
+  annotatePr();
+  buildProjFilter(s);applyProjFilter();
+}
+function histRow(r){
+  var when=new Date((r.ended||r.started||0)*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  var sub=r.children?(' <span class=eng>+'+r.children+' sub</span>'):'';
+  var bdg=(r.ultra?'<span class="badge ultra">ultra</span>':'')+(r.opus?'<span class="badge opus">opus</span>':'')+(r.tag?'<span class="badge tag">plan</span>':'')+(r.goal?'<span class="badge tag">goal</span>':'');
+  var pr=(r.branch?'<button class=sm data-diff="'+r.id+'">diff</button> ':'')+(r.pr_url?'<a href="'+esc(r.pr_url)+'" target=_blank><button class=sm data-pr="'+esc(r.pr_url)+'">PR ↗</button></a>':'');
+  return '<tr class=histrow data-proj="'+esc(r.project||'')+'"><td><span class="s-'+r.status+'">'+esc(r.status||'')+'</span>'+sub+'</td>'+
+    '<td class=eng>'+esc(when)+'</td><td class=eng>'+(r.project?projBadge(r.project)+' ':'')+(r.engine||'').slice(0,3)+'/'+(r.acct_no||'?')+'</td>'+
+    '<td>'+esc(r.prompt||'')+bdg+(r.branch?'<div class="tch mono">'+esc(r.branch)+'</div>':'')+'</td>'+
+    '<td style="text-align:right;white-space:nowrap">'+pr+' <button class=sm data-log="'+r.id+'">log</button></td></tr>';
+}
+function renderHistory(){
+  var box=document.getElementById('history');
+  if(!HIST){box.innerHTML='<div class=muted>loading…</div>';return}
+  box.innerHTML=HIST.length?
+    '<table><tr><th>status</th><th>when</th><th>eng/acct</th><th>task</th><th></th></tr>'+HIST.map(histRow).join('')+'</table>':
+    '<div class=muted>no run history yet — runs are archived permanently as they finish</div>';
+  annotatePr();applyProjFilter();
+}
+function showTab(name){
+  TAB=name;
+  document.querySelectorAll('#tabs .tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-tab')===name)});
+  document.getElementById('ledgerCard').style.display=name==='ledger'?'':'none';
+  document.getElementById('historyCard').style.display=name==='history'?'':'none';
+  document.getElementById('usageCard').style.display=name==='usage'?'':'none';
+  if(name==='history')loadHistory();
+  if(name==='usage')loadUsage();
+}
+var USAGE=null,USAGE_DAYS=30;
+function loadUsage(){fetch('/api/usage?days='+USAGE_DAYS).then(function(r){return r.json()}).then(function(j){USAGE=j;renderUsage()}).catch(function(){})}
+function usageTable(nameLbl,rows,nameFn){
+  if(!rows||!rows.length)return '<div class=muted style="margin:6px 0 14px">no usage recorded for this range</div>';
+  var num='text-align:right;white-space:nowrap';
+  return '<table style="margin-bottom:14px"><tr><th>'+nameLbl+'</th>'+
+    ['input','output','reasoning','cache write','cache read','done / requests','errors / 429','cost'].map(function(h){return '<th style="text-align:right">'+h+'</th>'}).join('')+'</tr>'+
+    rows.map(function(r){return '<tr><td>'+nameFn(r)+'</td>'+
+      ['in','out','reasoning','cw','cr'].map(function(k){return '<td style="'+num+'">'+fmtTok(r[k]||0)+'</td>'}).join('')+
+      '<td style="'+num+'">'+fmtTok(r.completions||0)+' / '+fmtTok(r.requests==null?(r.completions||0):r.requests)+'</td>'+
+      '<td style="'+num+'">'+fmtTok(r.errors||0)+' / '+fmtTok(r.rate_limits||0)+'</td>'+
+      '<td style="'+num+';font-weight:700;color:var(--accent)">'+fmtUsd(r.cost)+'</td></tr>'}).join('')+'</table>';
+}
+function openCodeTelemetryHtml(profiles){
+  if(!profiles||!profiles.length)return '';
+  return '<div class=modesec>OpenCode SQLite detail <span class=muted style="font-weight:400">(selected range · exact local records; no quota ceiling inferred)</span></div>'+profiles.map(function(p){
+    if(!p.available)return '<div class=moderow><b>'+esc(p.account||'OpenCode')+'</b> <span class=muted>'+esc(p.error||'no local database yet')+'</span></div>';
+    var t=p.totals||{},last=t.last_activity?new Date(t.last_activity*1000).toLocaleString():'—';
+    var tools=(p.tool_usage||[]).length?'<table style="margin-bottom:14px"><tr><th>tool</th><th>status</th><th style="text-align:right">calls</th></tr>'+(p.tool_usage||[]).map(function(x){return '<tr><td>'+esc(x.tool||'?')+'</td><td>'+esc(x.status||'?')+'</td><td style="text-align:right">'+fmtTok(x.calls||0)+'</td></tr>'}).join('')+'</table>':'<div class=muted>no tool calls</div>';
+    var lastErr=p.last_error?'<div class="inbox" style="display:block;background:transparent;color:var(--accent);border-color:var(--accent);margin:8px 0">Last OpenCode failure · '+esc(p.last_error.name||'Error')+(p.last_error.status?' HTTP '+esc(String(p.last_error.status)):'')+' · '+esc(p.last_error.message||'')+' · '+new Date((p.last_error.at||0)*1000).toLocaleString()+'</div>':'';
+    return '<div class=moderow><div class=mtitle>'+esc(p.account||'OpenCode')+' · '+fmtTok(t.out||0)+' output · '+fmtTok(t.in||0)+' input · '+fmtTok(t.reasoning||0)+' reasoning · '+fmtTok((t.cr||0)+(t.cw||0))+' cache · '+fmtUsd(t.cost)+'</div>'+
+      '<div class=tch>'+fmtTok(t.completions||0)+'/'+fmtTok(t.requests||0)+' completed/requests · '+fmtTok(t.unfinished||0)+' unfinished · '+fmtTok(t.errors||0)+' failures · '+fmtTok(t.rate_limits||0)+' rate limits · '+fmtTok(t.sessions||0)+' sessions ('+fmtTok(t.native_subagents||0)+' native subagents) · '+fmtTok(t.tool_calls||0)+' tools · '+fmtTok(t.files||0)+' files · +'+fmtTok(t.adds||0)+'/−'+fmtTok(t.dels||0)+' lines · last '+esc(last)+'</div>'+lastErr+
+      '<div class=modesec>Models</div>'+usageTable('model',p.models||[],function(r){return esc(r.model||'?')})+
+      '<div class=modesec>Built-in / native agent roles</div>'+usageTable('agent',p.agents||[],function(r){return esc(r.agent||'?')})+
+      '<div class=modesec>Tools</div>'+tools+'</div>';
+  }).join('');
+}
+function renderUsage(){
+  var tl=document.getElementById('usageTiles'),box=document.getElementById('usageBody');
+  if(!USAGE){tl.innerHTML='';box.innerHTML='<div class=muted>loading…</div>';return}
+  var g=USAGE.grand||{};
+  tl.innerHTML=
+    tile(fmtUsd(g.cost),'est. api value','accent')+
+    tile(fmtTok(g.out||0),'output tok','')+
+    tile(fmtTok(g['in']||0),'input tok','')+
+    tile(fmtTok(g.reasoning||0),'reasoning tok','')+
+    tile(fmtTok(g.completions||0)+'/'+fmtTok(g.requests||g.completions||0),'done / requests','')+
+    tile(fmtTok(g.errors||0)+'/'+fmtTok(g.rate_limits||0),'errors / 429','')+
+    tile(fmtTok(g.cw||0),'cache write tok','')+
+    tile(fmtTok(g.cr||0),'cache read tok','');
+  box.innerHTML=
+    '<div class=modesec style="margin-top:4px">By date <span class=muted style="font-weight:400">(newest first)</span></div>'+
+    usageTable('date',USAGE.by_date,function(r){return '<b>'+esc(r.date||'?')+'</b>'})+
+    '<div class=modesec>By model</div>'+
+    usageTable('model',USAGE.by_model,function(r){return esc((r.provider?r.provider+' / ':'')+(r.model||'?'))})+
+    '<div class=modesec>By provider</div>'+
+    usageTable('provider',USAGE.by_provider,function(r){return esc(r.provider||'?')})+
+    '<div class=modesec>By account</div>'+
+    usageTable('account',USAGE.by_account,function(r){return esc((r.provider?r.provider+' / ':'')+(r.account||'?'))})+
+    '<div class=modesec>By native agent</div>'+
+    usageTable('agent',USAGE.by_agent,function(r){return esc((r.account?r.account+' / ':'')+(r.agent||'?'))})+
+    '<div class=modesec>Top sessions <span class=muted style="font-weight:400">(API value first, then token volume so free OpenCode sessions still rank)</span></div>'+
+    usageTable('session',USAGE.by_session,function(r){return esc((r.provider?r.provider+' / ':'')+String(r.session||'?').slice(0,8))})+
+    openCodeTelemetryHtml(USAGE.opencode)+kimiTelemetryHtml(USAGE.kimi)+grokTelemetryHtml(USAGE.grok);
+}
+
+function kimiTelemetryHtml(profiles){
+  if(!profiles||!profiles.length)return '';
+  return '<div class=modesec>Kimi local detail <span class=muted style="font-weight:400">(selected range · session/agent wire logs)</span></div>'+profiles.map(function(p){
+    var t=p.totals||{};
+    return '<div class=moderow><div class=mtitle>'+esc(p.account||'Kimi')+' · '+fmtTok(t.out||0)+' output · '+fmtTok(t.in||0)+' input · '+fmtTok((t.cr||0)+(t.cw||0))+' cache</div>'+
+      '<div class=tch>'+fmtTok(t.completions||0)+'/'+fmtTok(t.requests||0)+' completed/requests · '+fmtTok(t.errors||0)+' failures · '+fmtTok(t.rate_limits||0)+' rate limits · '+fmtTok(t.sessions||0)+' sessions ('+fmtTok(t.native_subagents||0)+' native subagents) · '+fmtTok(t.tool_calls||0)+' tools · '+fmtTok(t.files||0)+' files</div>'+
+      '<div class=modesec>Models</div>'+usageTable('model',p.models||[],function(r){return esc(r.model||'?')})+'</div>';
+  }).join('');
+}
+function grokTelemetryHtml(profiles){
+  if(!profiles||!profiles.length)return '';
+  return '<div class=modesec>Grok local detail <span class=muted style="font-weight:400">(selected range · persisted session JSONL)</span></div>'+profiles.map(function(p){
+    var t=p.totals||{};
+    return '<div class=moderow><div class=mtitle>'+esc(p.account||'Grok')+' · '+fmtTok(t.out||0)+' output · '+fmtTok(t.in||0)+' input · '+fmtTok(t.reasoning||0)+' reasoning · '+fmtTok((t.cr||0)+(t.cw||0))+' cache</div>'+
+      '<div class=tch>'+fmtTok(t.completions||0)+'/'+fmtTok(t.requests||0)+' completed/requests · '+fmtTok(t.errors||0)+' failures · '+fmtTok(t.rate_limits||0)+' rate limits · '+fmtTok(t.sessions||0)+' sessions ('+fmtTok(t.native_subagents||0)+' native subagents) · '+fmtTok(t.tool_calls||0)+' tools · '+fmtTok(t.files||0)+' files</div>'+
+      '<div class=modesec>Models</div>'+usageTable('model',p.models||[],function(r){return esc(r.model||'?')})+'</div>';
+  }).join('');
+}
+var _PIERRE=null;
+function nativeDiffHtml(patch){
+  return (patch||'').split('\n').map(function(l){
+    var e=esc(l),st='';
+    if(l.indexOf('+++')===0||l.indexOf('---')===0)st='font-weight:700';
+    else if(l.indexOf('@@')===0)st='color:var(--dim);background:var(--card2)';
+    else if(l.charAt(0)==='+')st='color:#2e7d32;background:rgba(46,125,50,.08)';
+    else if(l.charAt(0)==='-')st='color:var(--accent);background:rgba(255,92,0,.07)';
+    else if(l.indexOf('diff --git')===0)st='font-weight:700;border-top:1px solid var(--line);display:block;margin-top:8px;padding-top:8px';
+    return '<span style="display:block;'+st+'">'+(e||' ')+'</span>';
+  }).join('');
+}
+function viewDiff(id){
+  document.getElementById('logTitle').textContent='diff · '+id;
+  var el=document.getElementById('logBody');
+  el.textContent='loading diff…';
+  document.getElementById('logModal').classList.add('show');
+  fetch('/api/rundiff/'+id).then(function(r){return r.json()}).then(function(j){
+    if(j.error){el.textContent=j.error;return}
+    var head='<div style="margin-bottom:8px"><b>'+esc(j.branch||'')+'</b> <span class=muted>vs '+esc(j.base||'')+' · '+esc(j.repo||'')+'</span> · <span style="color:var(--ok)">+'+(j.adds||0)+'</span> <span style="color:var(--accent)">−'+(j.dels||0)+'</span></div>'+
+      '<table style="margin-bottom:10px"><tr><th>file</th><th style="text-align:right">+</th><th style="text-align:right">−</th></tr>'+
+      (j.files||[]).map(function(f){return '<tr><td class=mono style="font-size:11px">'+esc(f.path)+'</td><td style="text-align:right;color:var(--ok)">+'+f.adds+'</td><td style="text-align:right;color:var(--accent)">−'+f.dels+'</td></tr>'}).join('')+'</table>';
+    el.innerHTML=head+'<div id=diffBody style="font:11px/1.5 ui-monospace,monospace;white-space:pre-wrap">'+nativeDiffHtml(j.patch)+'</div>';
+    if(j.patch)renderPierreDiff(j.patch);
+  }).catch(function(){el.textContent='(failed to load diff)'});
+}
+function renderPierreDiff(patch){
+  // diffs.com (@pierre/diffs) — upgrade the native rendering in place when the
+  // library loads + renders; otherwise the native view stays. Best-effort.
+  (async function(){
+    try{
+      var mod=_PIERRE||(await import('https://esm.sh/@pierre/diffs@1.2.10'));_PIERRE=mod;
+      var host=document.getElementById('diffBody');if(!host)return;
+      var files=mod.parsePatchFiles?mod.parsePatchFiles(patch):null;
+      if(files&&files.length&&mod.FileDiff){
+        var wrap=document.createElement('div');
+        for(var i=0;i<files.length;i++){
+          var fd=new mod.FileDiff({theme:{dark:'github-dark',light:'github-light'}});
+          var node=document.createElement('div');wrap.appendChild(node);
+          await fd.render({fileDiff:files[i],element:node});
+        }
+        host.innerHTML='';host.appendChild(wrap);
+      }
+    }catch(e){/* native fallback stays */}
+  })();
+}
+function viewLog(id){
+  document.getElementById('logTitle').textContent='log · '+id;
+  document.getElementById('logBody').textContent='loading…';
+  document.getElementById('logModal').classList.add('show');
+  fetch('/api/log/'+id).then(function(r){return r.text()}).then(function(t){
+    var el=document.getElementById('logBody');el.textContent=t||'(empty)';el.scrollTop=el.scrollHeight;
+  }).catch(function(){document.getElementById('logBody').textContent='(failed to load log)'});
+}
+var PROJFILTER='';
+function buildProjFilter(s){
+  var set={};
+  (s.runs||[]).forEach(function(r){if(r.project)set[r.project]=1});
+  (s.ambient||[]).forEach(function(r){if(r.project)set[r.project]=1});
+  var names=Object.keys(set).sort();
+  var el=document.getElementById('projFilter');if(!el)return;
+  if(names.length<2){el.innerHTML='';return}   // only show the filter when 2+ projects appear
+  el.innerHTML='<span class=muted style="font-size:10px;text-transform:uppercase;letter-spacing:.1em">project</span>'+
+    ['', ].concat(names).map(function(n){
+      return '<span class="tab'+(PROJFILTER===n?' active':'')+'" data-proj-filter="'+esc(n)+'" style="padding:3px 9px;font-size:10px">'+(n?esc(n):'all')+'</span>';
+    }).join('');
+  applyProjFilter();
+}
+function applyProjFilter(){
+  document.querySelectorAll('#runs tr[data-proj],#history tr[data-proj]').forEach(function(tr){
+    tr.style.display=(!PROJFILTER||tr.getAttribute('data-proj')===PROJFILTER)?'':'none';
+  });
+}
+var MODES=null;
+function cmdBlock(c){return '<code class=cmd data-copy="'+esc(c)+'" title="click to copy">'+esc(c)+'</code>'}
+function renderModes(){
+  var box=document.getElementById('modesBody');
+  if(!MODES){box.innerHTML='<div class=muted>loading…</div>';return}
+  if(!(MODES.modes||[]).length&&!(MODES.account_commands||[]).length){
+    box.innerHTML='<div class=muted>no modes available — is neomax up to date? (`neomax modes --json`)</div>';return}
+  var h='';
+  if(MODES.launch_dir)h+='<div class=tch style="margin:0 0 4px">run from: <span class=mono>'+esc(MODES.launch_dir)+'</span></div>';
+  function modeRow(m){
+    var ow=(m.orchestrator||m.workers)?' <span class=eng>'+esc(m.orchestrator||'')+' → '+esc(m.workers||'')+'</span>':'';
+    return '<div class=moderow><div class=mtitle>'+esc(m.title||m.id||'')+ow+'</div>'+
+      '<div style="margin:6px 0 4px">'+cmdBlock(m.cmd||'')+'</div>'+
+      (m.why?'<div class=tch>'+esc(m.why)+'</div>':'')+'</div>';
+  }
+  // group modes by their (optional) section, preserving first-appearance order
+  var secOrder=[],bySec={};
+  (MODES.modes||[]).forEach(function(m){
+    var s=m.section||'Start an orchestrator session';
+    if(!bySec[s]){bySec[s]=[];secOrder.push(s)}
+    bySec[s].push(m);
+  });
+  secOrder.forEach(function(s){
+    h+='<div class=modesec>'+esc(s)+'</div>';
+    h+=bySec[s].map(modeRow).join('');
+  });
+  h+='<div class=modesec>Accounts &amp; tools</div>';
+  h+=(MODES.account_commands||[]).map(function(c){
+    return '<div class=moderow><div class=mtitle>'+esc(c.what||'')+'</div><div style="margin-top:6px">'+cmdBlock(c.cmd||'')+'</div></div>';
+  }).join('');
+  box.innerHTML=h;
+}
+function openModes(){
+  document.getElementById('modesModal').classList.add('show');
+  renderModes();
+  fetch('/api/modes').then(function(r){return r.json()}).then(function(j){MODES=j;renderModes()})
+    .catch(function(){if(!MODES){MODES={};renderModes()}});
+}
+function copyCmd(el){
+  var c=el.getAttribute('data-copy')||'';
+  function flash(){el.textContent='copied';setTimeout(function(){el.textContent=c},900)}
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(c).then(flash,function(){legacyCopy(c);flash()})}
+  else{legacyCopy(c);flash()}
+}
+function legacyCopy(s){
+  var ta=document.createElement('textarea');ta.value=s;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand('copy')}catch(e){}
+  document.body.removeChild(ta);
+}
+var HIST=null,TAB='ledger';
+function load(){fetch('/api/status').then(function(r){return r.json()}).then(function(j){DATA=j;render()}).catch(function(){})}
+var PRSTATE={};
+function annotatePr(){
+  document.querySelectorAll('button[data-pr]').forEach(function(btn){
+    var u=btn.getAttribute('data-pr');
+    if(PRSTATE[u]){if(PRSTATE[u].label)btn.textContent='PR '+PRSTATE[u].label+' ↗';return}
+    PRSTATE[u]={};
+    fetch('/api/prstate?url='+encodeURIComponent(u)).then(function(r){return r.json()}).then(function(j){
+      var lbl=j.merged?'merged':(j.state?String(j.state).toLowerCase()+(j.isDraft?'/draft':''):'');
+      PRSTATE[u]={label:lbl};
+      document.querySelectorAll('button[data-pr="'+u.replace(/"/g,'')+'"]').forEach(function(b){if(lbl)b.textContent='PR '+lbl+' ↗'});
+    }).catch(function(){});
+  });
+}
+function loadHistory(){fetch('/api/history').then(function(r){return r.json()}).then(function(j){HIST=j;renderHistory()}).catch(function(){});
+  fetch('/api/sessions').then(function(r){return r.json()}).then(function(j){
+    var el=document.getElementById('sessHist');if(!el)return;
+    el.innerHTML=(j&&j.length)?'<table><tr><th>last active</th><th>eng/acct</th><th>session</th><th>where / model</th><th style="text-align:right">tokens (out / in / reason / cache)</th><th style="text-align:right">done / req / err / 429</th><th style="text-align:right">tools</th><th style="text-align:right">cost</th></tr>'+
+      j.map(function(x){
+        var when=new Date((x.last_active||0)*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+        return '<tr><td class=eng>'+esc(when)+(x.active?' <span class="chip cool">ACTIVE</span>':'')+'</td>'+
+          '<td class=eng>'+esc((x.engine||'').slice(0,3))+'/'+esc(String(x.acct_no))+'</td>'+
+          '<td class="eng mono">'+esc(String(x.session||'').slice(0,8))+'</td>'+
+          '<td>'+esc(((x.cwd||'').split('/').slice(-1)[0])||'?')+(x.branch?' <code style="font-size:10px">'+esc(x.branch)+'</code>':'')+(x.model?'<div class="tch mono">'+esc(shortModel(x.model))+'</div>':'')+(x.label?'<div class=tch>'+esc(String(x.label).slice(0,90))+'</div>':'')+'</td>'+
+          '<td style="text-align:right;white-space:nowrap">'+fmtTok(x.out||0)+' / '+fmtTok(x.in||0)+' / '+fmtTok(x.reasoning||0)+' / '+fmtTok(x.cache||0)+'</td>'+
+          '<td style="text-align:right;white-space:nowrap">'+fmtTok(x.completions||0)+' / '+fmtTok(x.requests==null?(x.completions||0):x.requests)+' / '+fmtTok(x.errors||0)+' / '+fmtTok(x.rate_limits||0)+'</td>'+
+          '<td style="text-align:right;white-space:nowrap">'+fmtTok(x.tool_calls||0)+(x.tool_errors?' / <span style="color:var(--accent)">'+fmtTok(x.tool_errors)+' err</span>':'')+'</td>'+
+          '<td style="text-align:right;color:var(--accent);font-weight:600">'+fmtUsd(x.cost||0)+'</td></tr>';
+      }).join('')+'</table>':'<div class=muted>no interactive sessions in the last 3 days</div>';
+  }).catch(function(){});
+  fetch('/api/subagents').then(function(r){return r.json()}).then(function(j){
+    var el=document.getElementById('subHist');if(!el)return;
+    el.innerHTML=(j&&j.length)?'<table><tr><th>when</th><th>eng/acct/sess</th><th>status</th><th>mission / model</th><th style="text-align:right">tokens (out / in / reason / cache)</th><th style="text-align:right">done / req / err / tools</th><th style="text-align:right">files</th><th style="text-align:right">± lines</th><th></th></tr>'+
+      j.map(function(x,i){
+        var when=new Date((x.ended||0)*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+        var st=x.status==='running'?'<span class="chip cool">running</span>':(x.status==='done'?'done':'<span class=muted>stopped</span>');
+        var fl=x.files&&x.files.length?'<button class=sm data-subfiles="'+i+'">files</button>':'';
+        var t=x.tokens||{},cache=(t.cr||0)+(t.cw||0);
+        return '<tr><td class=eng>'+esc(when)+'</td>'+
+          '<td class=eng>'+esc((x.engine||'claude').slice(0,3))+'/'+x.acct_no+'/'+esc(String(x.session||'').slice(0,8))+(x.wf?'<div class=tch><code style="font-size:9px">'+esc(String(x.wf).slice(0,11))+'</code></div>':'')+'</td>'+
+          '<td>'+st+'</td><td>'+esc(String(x.label||'').slice(0,90))+(x.model?'<div class="tch mono">'+esc(shortModel(x.model))+'</div>':'')+'</td>'+
+          '<td style="text-align:right;white-space:nowrap">'+fmtTok(t.out||0)+' / '+fmtTok(t.in||0)+' / '+fmtTok(t.reasoning||0)+' / '+fmtTok(cache)+'</td>'+
+          '<td style="text-align:right;white-space:nowrap">'+fmtTok(x.completions||0)+' / '+fmtTok(x.requests||0)+' / '+fmtTok(x.errors||0)+' / '+fmtTok(x.tool_calls||0)+'</td>'+
+          '<td style="text-align:right">'+(x.files?x.files.length:0)+'</td>'+
+          '<td style="text-align:right;white-space:nowrap"><span style="color:var(--ok)">+'+(x.adds||0)+'</span> <span style="color:var(--accent)">−'+(x.dels||0)+'</span></td>'+
+          '<td style="text-align:right">'+fl+'</td></tr>';
+      }).join('')+'</table>':'<div class=muted>no sub-agent activity in the last 3 days</div>';
+    window._SUBH=j;
+  }).catch(function(){});}
+function showSubFiles(i){
+  var x=(window._SUBH||[])[i];if(!x)return;
+  document.getElementById('logTitle').textContent='sub-agent files · '+String(x.session||'').slice(0,8)+' · '+String(x.label||'').slice(0,60);
+  var el=document.getElementById('logBody');
+  el.textContent='';
+  el.innerHTML='<table style="width:100%">'+'<tr><th>file</th><th style="text-align:right">edits</th><th style="text-align:right">+ lines</th><th style="text-align:right">− lines</th></tr>'+
+    (x.files||[]).map(function(f){return '<tr><td class=mono style="font-size:11px">'+esc(f.path)+'</td><td style="text-align:right">'+f.ops+'</td><td style="text-align:right;color:var(--ok)">+'+f.adds+'</td><td style="text-align:right;color:var(--accent)">−'+f.dels+'</td></tr>'}).join('')+'</table>'+
+    '<div class=muted style="margin-top:8px;font-size:11px">file activity from persisted Edit/Write calls (Claude transcripts, OpenCode SQLite parts, Kimi wire logs, or Grok session JSONL); line counts are payload-based approximations — orchestrator-run DIFF remains the exact git view</div>';
+  document.getElementById('logModal').classList.add('show');
+}
+function connect(eng,n){if(!confirm('Authenticate '+eng+' account '+n+'?\n'+(eng==='claude'?'Opens a Terminal running `cmax '+n+'` — sign in there.':(eng==='opencode'?'Opens a Terminal running `ocx login '+n+'`.':(eng==='kimi'?'Opens a Terminal running `kmx login '+n+' choose`.':(eng==='grok'?'Opens a Terminal running `gmx login '+n+' choose`.':'A browser / device-code sign-in will open.'))))))return;
+  fetch('/api/connect/'+eng+'/'+n,{method:'POST'}).then(function(r){return r.json()}).then(function(j){alert(j.message||'started');setTimeout(load,1500)})}
+function act(a,id){fetch('/api/act/'+a+'/'+id,{method:'POST'}).then(function(r){return r.json()}).then(function(j){if(j.message)console.log('[neomax]',j.message);load();if(TAB==='history')loadHistory()})}
+function pauseAcct(eng,n,on){fetch('/api/'+(on?'pause':'unpause')+'/'+eng+'/'+n,{method:'POST'}).then(function(r){return r.json()}).then(function(j){if(j.message)console.log('[neomax]',j.message);load()})}
+function applyTheme(mode){
+  if(mode==='light')document.documentElement.setAttribute('data-theme','light');
+  else document.documentElement.removeAttribute('data-theme');
+  var b=document.getElementById('themeBtn');if(b)b.textContent=(mode==='light'?'◑ Dark':'◐ Light');
+}
+function toggleTheme(){
+  var next=document.documentElement.getAttribute('data-theme')==='light'?'dark':'light';
+  try{localStorage.setItem('cmaxTheme',next)}catch(e){}
+  applyTheme(next);
+}
+(function(){var t='dark';try{t=localStorage.getItem('cmaxTheme')||'dark'}catch(e){}applyTheme(t)})();
+document.addEventListener('click',function(e){
+  var t=e.target.closest('[data-act],[data-c-eng],[data-p-eng],[data-log],[data-diff],[data-subfiles],[data-tab],[data-usagedays],[data-copy],#logClose,#themeBtn,#quickBtn,#modesClose');if(!t)return;
+  if(t.id==='themeBtn')toggleTheme();
+  else if(t.id==='quickBtn')openModes();
+  else if(t.id==='modesClose')document.getElementById('modesModal').classList.remove('show');
+  else if(t.id==='logClose')document.getElementById('logModal').classList.remove('show');
+  else if(t.hasAttribute('data-diff'))viewDiff(t.getAttribute('data-diff'));
+  else if(t.hasAttribute('data-subfiles'))showSubFiles(+t.getAttribute('data-subfiles'));
+  else if(t.hasAttribute('data-proj-filter')){PROJFILTER=t.getAttribute('data-proj-filter');buildProjFilter(DATA||{});applyProjFilter();}
+  else if(t.hasAttribute('data-copy'))copyCmd(t);
+  else if(t.hasAttribute('data-usagedays')){
+    USAGE_DAYS=parseInt(t.getAttribute('data-usagedays'),10)||0;
+    document.querySelectorAll('[data-usagedays]').forEach(function(b){b.classList.toggle('active',b===t)});
+    USAGE=null;renderUsage();loadUsage();
+  }
+  else if(t.hasAttribute('data-tab'))showTab(t.getAttribute('data-tab'));
+  else if(t.hasAttribute('data-log'))viewLog(t.getAttribute('data-log'));
+  else if(t.hasAttribute('data-c-eng'))connect(t.getAttribute('data-c-eng'),t.getAttribute('data-c-n'));
+  else if(t.hasAttribute('data-p-eng'))pauseAcct(t.getAttribute('data-p-eng'),t.getAttribute('data-p-n'),t.getAttribute('data-p-on')==='1');
+  else act(t.getAttribute('data-act'),t.getAttribute('data-id'));
+});
+document.getElementById('logModal').addEventListener('click',function(e){if(e.target===this)this.classList.remove('show')});
+document.getElementById('modesModal').addEventListener('click',function(e){if(e.target===this)this.classList.remove('show')});
+load();setInterval(load,5000);setInterval(render,1000);
+setInterval(function(){if(TAB==='history')loadHistory()},8000);
+</script></div></body></html>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode() if isinstance(body, str) else body
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            # The browser closed the socket before we finished writing — a poll
+            # superseded by the 5s refresh, a closed tab, a navigated-away page.
+            # Entirely normal; swallow it so ThreadingHTTPServer doesn't dump a
+            # traceback per disconnect. Mark the conn closed so the thread exits.
+            self.close_connection = True
+
+    def log_message(self, *a):
+        pass  # quiet
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/" or path == "/index.html":
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif path == "/api/status":
+            self._send(200, json.dumps(status_json()))
+        elif path == "/api/history":
+            self._send(200, json.dumps(history_json()))
+        elif path == "/api/modes":
+            self._send(200, json.dumps(modes_json()))
+        elif path == "/api/usage":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                days = int((q.get("days") or ["30"])[0])
+            except ValueError:
+                days = 30
+            self._send(200, json.dumps(usage_json(days)))
+        elif path == "/api/sessions":
+            self._send(200, json.dumps(sessions_json()))
+        elif path == "/api/subagents":
+            self._send(200, json.dumps(subagents_json()))
+        elif path.startswith("/api/rundiff/"):
+            rid = path[len("/api/rundiff/"):]
+            if not re.match(r"^\d{8}-\d{6}-\d+(-[A-Za-z0-9._-]+)?$", rid):
+                self._send(400, json.dumps({"error": "invalid run id"}))
+            else:
+                self._send(200, json.dumps(rundiff_json(rid)))
+        elif path == "/api/prstate":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            url = (q.get("url") or [""])[0]
+            self._send(200, json.dumps(pr_state(url)))
+        elif path.startswith("/api/log/"):
+            rid = path[len("/api/log/"):]
+            if not re.match(r"^\d{8}-\d{6}-\d+(-[A-Za-z0-9._-]+)?$", rid):
+                self._send(400, "invalid run id", "text/plain; charset=utf-8")
+            else:
+                self._send(200, run_log(rid) or "(no log available)",
+                           "text/plain; charset=utf-8")
+        else:
+            self._send(404, "{}")
+
+    def _same_origin(self):
+        # reject cross-origin POSTs (defense-in-depth vs a malicious page in the
+        # browser POSTing to 127.0.0.1). A same-origin fetch sends no Origin or our
+        # own; browsers cannot forge Origin.
+        origin = self.headers.get("Origin")
+        if origin and origin not in ("http://127.0.0.1:%d" % PORT,
+                                     "http://localhost:%d" % PORT):
+            return False
+        return True
+
+    def do_POST(self):
+        if not self._same_origin():
+            self._send(403, json.dumps({"error": "cross-origin POST rejected"}))
+            return
+        parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
+        try:
+            if parts[:2] == ["api", "connect"] and len(parts) == 4:
+                self._send(200, json.dumps(self._connect(parts[2], parts[3])))
+            elif parts[:2] == ["api", "act"] and len(parts) == 4:
+                self._send(200, json.dumps(self._act(parts[2], parts[3])))
+            elif parts[:2] == ["api", "pause"] and len(parts) == 4:
+                self._send(200, json.dumps(self._pause(parts[2], parts[3], True)))
+            elif parts[:2] == ["api", "unpause"] and len(parts) == 4:
+                self._send(200, json.dumps(self._pause(parts[2], parts[3], False)))
+            else:
+                self._send(404, "{}")
+        except Exception as e:
+            self._send(500, json.dumps({"error": str(e)}))
+
+    def _connect(self, eng, n):
+        if eng not in ("claude", "codex", "opencode", "kimi", "grok") or not (n.isdigit() or n == "orch"):
+            return {"error": "bad engine/account"}          # digits or 'orch' only → no injection
+        if eng == "codex":
+            prof = os.path.join(HOME, ".codex-orch" if n == "orch"
+                                else (".codex" if n == "1" else ".codex-acct%s" % n))
+            os.makedirs(prof, exist_ok=True)
+            env = dict(os.environ, CODEX_HOME=prof)
+            subprocess.Popen(["codex", "login"], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            return {"message": "codex login started for account %s — complete the "
+                    "browser sign-in, then it will show as authenticated." % n}
+        if eng == "opencode":
+            arg = "orch" if n == "orch" else n
+            if sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                    'tell app "Terminal" to do script "ocx login %s"' % arg],
+                    start_new_session=True)
+                return {"message": "opened a Terminal running `ocx login %s`." % arg}
+            return {"message": "run `ocx login %s` in a terminal." % arg}
+        if eng == "kimi":
+            arg = "orch" if n == "orch" else n
+            if sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                    'tell app "Terminal" to do script "kmx login %s choose"' % arg],
+                    start_new_session=True)
+                return {"message": "opened a Terminal running `kmx login %s choose`." % arg}
+            return {"message": "run `kmx login %s choose` in a terminal." % arg}
+        if eng == "grok":
+            arg = "orch" if n == "orch" else n
+            if sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                    'tell app "Terminal" to do script "gmx login %s choose"' % arg],
+                    start_new_session=True)
+                return {"message": "opened a Terminal running `gmx login %s choose`." % arg}
+            return {"message": "run `gmx login %s choose` in a terminal." % arg}
+        if sys.platform == "darwin":
+            # n is validated digits-only above, so it cannot break out of the string.
+            arg = "orchestrator" if n == "orch" else n
+            subprocess.Popen(["osascript", "-e",
+                'tell app "Terminal" to do script "cmax %s"' % arg], start_new_session=True)
+            return {"message": "opened a Terminal running `cmax %s` — run /login "
+                    "there to sign in." % arg}
+        return {"message": "run `cmax %s` in a terminal, then /login." % (
+            "orchestrator" if n == "orch" else n)}
+
+    def _pause(self, eng, n, on):
+        # toggle an account in/out of auto-dispatch. n is validated digits/'orch' (no injection).
+        if eng not in ("claude", "codex", "opencode", "kimi", "grok") or not (n.isdigit() or n == "orch"):
+            return {"error": "bad engine/account"}
+        cmd = "pause" if on else "unpause"
+        try:
+            r = subprocess.run([NEOMAX, cmd, n, "--engine", eng],
+                               capture_output=True, text=True, timeout=15)
+            return {"message": (r.stdout or r.stderr).strip()[:200]
+                    or ("%sd %s account %s" % (cmd, eng, n))}
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"error": str(e)}
+
+    def _act(self, action, rid):
+        if action not in ("resume", "retry", "kill", "ack", "clean"):
+            return {"error": "unknown action"}
+        # rid MUST be a real run-id: base (YYYYMMDD-HHMMSS-PID) or a run-all part
+        # (base + "-<partid>"). Never a flag like "--done"/"--all", so a CSRF/forged
+        # request can't trigger a bulk op (the leading digits forbid a "-" prefix).
+        if not re.match(r"^\d{8}-\d{6}-\d+(-[A-Za-z0-9._-]+)?$", rid):
+            return {"error": "invalid run id"}
+        if action in ("resume", "retry"):
+            # these BLOCK for the whole worker run — detach so the HTTP request
+            # returns immediately and the run isn't killed when the portal stops.
+            # Honor NEOMAX_HOME (hermetic tests / relocated state) instead of hardcoding
+            # ~/.neomax, and close the parent's log fd after spawn so it isn't leaked.
+            state = os.environ.get("NEOMAX_HOME") or os.path.expanduser("~/.neomax")
+            try:
+                os.makedirs(state, exist_ok=True)
+                logf = open(os.path.join(state, "portal-%s.log" % rid), "ab")
+            except OSError:
+                logf = subprocess.DEVNULL
+            try:
+                subprocess.Popen([NEOMAX, action, rid], stdout=logf, stderr=logf,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            finally:
+                if logf is not subprocess.DEVNULL:
+                    try:
+                        logf.close()
+                    except OSError:
+                        pass
+            return {"message": "%s started for %s — watch the run ledger." % (action, rid)}
+        r = subprocess.run([NEOMAX, action, rid], capture_output=True,
+                           text=True, timeout=30)
+        return {"message": (r.stdout or r.stderr).strip()[:300]}
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+def ensure_usage_watcher():
+    """Belt-and-suspenders: the token-usage watcher normally runs as a launchd agent
+    (auto), but if it isn't running, start a detached one so the dashboard always has
+    live usage. Never fails the portal."""
+    try:
+        r = subprocess.run(["pgrep", "-f", "neomax usage-watch"],
+                           capture_output=True, text=True, timeout=5)
+        if not r.stdout.strip():
+            subprocess.Popen([sys.executable, NEOMAX, "usage-watch"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    ensure_usage_watcher()
+    httpd = Server(("127.0.0.1", PORT), Handler)
+    print("neomax-portal → http://127.0.0.1:%d  (Ctrl-C to stop)" % PORT)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
