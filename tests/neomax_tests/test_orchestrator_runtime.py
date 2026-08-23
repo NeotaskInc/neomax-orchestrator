@@ -444,6 +444,18 @@ def test_orient_directive():
             "--pr",
         ):
             check(cap in t4, "toolbox names the %r capability" % cap)
+        for command in (
+            "neomax resume",
+            "neomax retry",
+            "neomax kill",
+            "neomax orchestrators",
+            "neomax handoff",
+            "neomax rotate-auth",
+            "neomax task add",
+            "neomax issue open",
+            "neomax usage",
+        ):
+            check(command in t4, "toolbox gives the exact %r invocation" % command)
         check(
             "run in parallel" in t4 and "EVENLY" in t4,
             "opener states the one principle: parallel work spread evenly across accounts",

@@ -3,6 +3,73 @@
 from .support import *
 
 
+def test_agent_command_surface():
+    print("test_agent_command_surface")
+    import ast
+
+    cli_path = os.path.join(ROOT, "lib", "neomax", "cli.py")
+    tree = ast.parse(open(cli_path).read())
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    module_aliases = {}
+    for node in ast.walk(main):
+        if isinstance(node, ast.ImportFrom) and node.module is None:
+            for alias in node.names:
+                module_aliases[alias.asname or alias.name] = alias.name
+    targets = set()
+    for node in ast.walk(main):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        ):
+            continue
+        alias = node.func.value.id
+        if alias in module_aliases:
+            targets.add((module_aliases[alias], node.func.attr))
+    check(
+        targets
+        and all(
+            callable(getattr(importlib.import_module("neomax." + module), attr, None))
+            for module, attr in targets
+        ),
+        "every Python CLI dispatch target resolves to a callable registered module owner",
+    )
+
+    def string_values(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return set().union(*(string_values(item) for item in node.elts))
+        return set()
+
+    cli_routes = set()
+    for node in ast.walk(main):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        test = node.test
+        if isinstance(test.left, ast.Name) and test.left.id == "cmd":
+            cli_routes.update(string_values(test.comparators[0]))
+    shell = open(os.path.join(BIN, "neomax")).read()
+    case_match = re.search(r'case "\$\{1:-\}" in\n(.*?)\nesac', shell, re.S)
+    shell_routes = set()
+    for line in case_match.group(1).splitlines():
+        match = re.match(r"\s*([^#][^)]*)\)", line)
+        if match:
+            shell_routes.update(part.strip() for part in match.group(1).split("|"))
+    check(
+        shell_routes == ((cli_routes - {"__supervise"}) | {"auto"}),
+        "the public shell wrapper reaches every user-facing Python command alias",
+    )
+    check(
+        '${1:-}" == "commands"' in shell,
+        "the public wrapper preserves the Python command-registry help alias",
+    )
+
+
 def test_public_product_contract():
     print("test_public_product_contract")
     manifest = json.load(open(os.path.join(ROOT, "package.json")))

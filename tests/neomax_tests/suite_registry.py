@@ -14,6 +14,7 @@ SUITE_REGISTRY = (
         "test_product_contracts",
         "Public packaging, provider parity, launch selection, goals, and delegation safety.",
         (
+            "test_agent_command_surface",
             "test_public_product_contract",
             "test_provider_workflow_parity_and_install",
             "test_neomax_engine_selection",
@@ -204,6 +205,7 @@ SUITE_REGISTRY = (
 )
 
 TEST_ORDER = (
+    "test_agent_command_surface",
     "test_public_product_contract",
     "test_provider_workflow_parity_and_install",
     "test_neomax_engine_selection",

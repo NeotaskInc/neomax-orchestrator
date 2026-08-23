@@ -15,7 +15,7 @@ launcher_for() {
   esac
 }
 
-if [[ "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+if [[ "${1:-}" == "help" || "${1:-}" == "commands" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   print -r -- 'usage: neomax [--engine ENGINE] [--prefer ENGINE,...] [--workers SCOPE] [MODEL_FLAGS...] [INITIAL_TASK...]
        neomax launch resume [SESSION_ID] [--engine ENGINE]
        neomax delegate [WORKER_OPTIONS...] auto|ACCOUNT "PROMPT"
