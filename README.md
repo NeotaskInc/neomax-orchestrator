@@ -2,13 +2,23 @@
 
 [![CI](https://github.com/NeotaskInc/neomax-orchestrator/actions/workflows/test.yml/badge.svg)](https://github.com/NeotaskInc/neomax-orchestrator/actions/workflows/test.yml)
 
-Run Claude Code, Codex, OpenCode, Kimi Code, and Grok Build accounts on one machine, then farm work to isolated, resumable workers. Any of the five CLIs can orchestrate any selected combination of worker pools.
+Neomax is Neotask's open-source universal coding-agent orchestration layer. It combines six harness surfaces—Neomax itself plus Claude Code, Codex, OpenCode, Kimi Code, and Grok Build—so one project can use multiple providers, accounts, agent harnesses, and locally available models at the same time. Any supported provider CLI can be the main orchestrator. Routing can follow an explicit user selection, an orchestrator's task-by-task decision, a plan's per-part engine and model, or dynamic provider/account eligibility; every run records the effective route and model.
 
 Issues and pull requests are welcome at the [Neotask Inc. repository](https://github.com/NeotaskInc/neomax-orchestrator). See [CONTRIBUTING.md](CONTRIBUTING.md) and the provider-neutral [AGENTS.md](AGENTS.md) development guide.
 
+## Multi-harness orchestration and model routing
+
+Neomax is not merely an account rotator. It is a provider-neutral control plane for composing available coding agents into one durable fleet:
+
+- **Six harness surfaces, one system:** use the universal `neomax` launcher or pin Claude with `cmax`, Codex with `cdxmax`, OpenCode with `ocmax`, Kimi with `kmax`, or Grok with `gmax`.
+- **Providers and models can run together:** a single orchestration plan can dispatch concurrent Claude, Codex, OpenCode, Kimi, and Grok workers, with different models selected per worker or plan part.
+- **Selectable and dynamic Neotask routing:** keep provider defaults, explicitly pin the orchestrator or any worker, assign an engine and model per plan part, let the orchestrator choose by task, or let Neomax dynamically select an eligible provider and account. Any model supported by the selected provider's local CLI or model registry remains available, and the effective choice is preserved in run history and usage telemetry.
+- **Any connected subset works:** Neomax dynamically adapts whether the machine has one provider, several providers, or all five. No provider is required merely because another provider is orchestrating.
+- **Durable execution across harnesses:** work is isolated in resumable worktrees and tracked through one lifecycle, history, usage, issue, queue, rotation, and portal surface regardless of which provider performs it.
+
 ## Automatic quota survival
 
-Neomax is built to keep work moving across accounts instead of dying with whichever login happened to start it.
+Keeping that multi-provider fleet alive across accounts and usage windows is a major part of the system, not its entire purpose.
 
 - **Usage-aware account selection:** automatic dispatch chooses an eligible account with usable quota headroom, balances live contention across the fleet, and favors soon-resetting allowance when accounts are otherwise close so expiring capacity is not wasted.
 - **A hard 99% wall without stranded work:** when a provider exposes quota percentages, a profile at 99% is ineligible for automatic new work. If a delegated task starts below the wall—for example, at 92%—and reaches the limit while it is running, Neomax does not discard or restart the task from scratch. When the CLI reports the usage-limit event, Neomax cools that account and automatically continues the same durable task in the same worktree on another same-provider account. If that provider pool is exhausted, it continues cross-provider when the launch scope permits. Claude interactive sessions go further: the model-free rotation path can swap their authentication in place so the live session itself keeps going. This is continuation, not blind dispatch into an exhausted window.
