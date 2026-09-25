@@ -23,3 +23,12 @@ operational notes. Maintainer-only context belongs in the ignored WORKLOG.local.
   `git diff --check` passed. Application code is unchanged.
 - Remote CI on the candidate revision remains pending; this source check does
   not establish runner installation access or execution.
+
+## 2026-09-25 - Pin CI actions and keep main runs
+
+- Pin every CI action to a full commit SHA, add a 10-minute job timeout, stop
+  persisting the checkout token, and cancel superseded runs only for pull
+  requests so every `main` push keeps its CI result. The verification steps
+  are unchanged.
+- Verification: Actionlint passed for `.github/workflows/test.yml`; the shared
+  runner audit reports Blacksmith only; `git diff --check` passed.
