@@ -28,7 +28,8 @@ operational notes. Maintainer-only context belongs in the ignored WORKLOG.local.
 
 - Pin every CI action to a full commit SHA, add a 10-minute job timeout, stop
   persisting the checkout token, and cancel superseded runs only for pull
-  requests so every `main` push keeps its CI result. The verification steps
-  are unchanged.
+  requests. Each `main` push runs in its own concurrency group, so a later
+  push can no longer replace a pending one and every landed commit keeps its
+  CI result. The verification steps are unchanged.
 - Verification: Actionlint passed for `.github/workflows/test.yml`; the shared
   runner audit reports Blacksmith only; `git diff --check` passed.
